@@ -1,7 +1,7 @@
 # LemmaScript — Implementation Specification
 
-**Version:** 0.3
-**Date:** April 2026
+**Version:** 0.5.6
+**Date:** June 2026
 
 Backend-specific details:
 - [SPEC_LEAN.md](SPEC_LEAN.md) — Lean backend (Velvet/Loom, four-file scheme, proof workflow)
@@ -28,6 +28,7 @@ Annotations are TypeScript comments of the form `//@ <keyword> <expression>`.
 | Keyword | Placement | Meaning |
 |---------|-----------|---------|
 | `backend` | Top of file | Restrict file to a specific backend (see §2.6) |
+| `safe-slice` | Top of file | Opt into JS-clamping semantics for two-arg `arr.slice(lo, hi)` (see §2.7) |
 | `verify` | Before first statement of function/method body | Mark function for verification (see §2.5) |
 | `requires` | Before first statement of function body | Precondition |
 | `ensures` | Before first statement of function body | Postcondition (`\result` refers to return value) |
@@ -43,7 +44,8 @@ Annotations are TypeScript comments of the form `//@ <keyword> <expression>`.
 | `havoc` | Before a variable declaration | Nondeterministic value — skip init expression (see §2.9). |
 | `havoc <key>` | Before a variable declaration | Nondeterministic subexpression — replace calls matching `<key>` (see §2.10). |
 | `declare-type N { f: T, ... }` | Before any statement | Declare a record type for cross-file types (see §2.5). |
-| `extern` | Before function declaration | Treat function as a body-less axiom — extract signature only, skip body (see §2.11). |
+| `extern` | Before function declaration | Treat function as a body-less axiom — extract signature only, skip body (see §2.11). `//@ extern NS.method` registers it under a dotted name. |
+| `autohavoc` | File-level, or before a `//@ verify` function | Abstract every unmodellable expression to a nondeterministic value, so verification rests only on declared contracts (see §2.12). Dafny only. |
 | `skip` | Before any statement | Omit statement from verification model (for side-effect-only code). |
 
 ### 2.2 Spec Expression Grammar
@@ -51,7 +53,8 @@ Annotations are TypeScript comments of the form `//@ <keyword> <expression>`.
 The expression language is a subset of TypeScript with verification extensions.
 
 ```
-expr     := implies
+expr     := iff
+iff      := implies ('<==>' iff)?        // right-associative; binds loosest
 implies  := or ('==>' implies)?          // right-associative
 or       := and ('||' and)*
 and      := compare ('&&' compare)*
@@ -65,6 +68,7 @@ cmpOp    := ... | 'in'                        // set/seq/map membership
 atom     := NUMBER | HEX_NUMBER | IDENT | 'true' | 'false' | '\result'
           | 'forall' '(' IDENT (':' TYPE)? ',' expr ')'
           | 'exists' '(' IDENT (':' TYPE)? ',' expr ')'
+          | 'perm' '(' expr ',' expr ')'        // permutation predicate (spec-only; Dafny backend)
           | '(' expr ')'
           | '[' (expr ',')* expr? ']'
           | '{' (IDENT ':' expr ',')* IDENT ':' expr '}'
@@ -73,7 +77,9 @@ TYPE     := IDENT                             // 'nat', 'int', 'string', user ty
 
 **`\result`** refers to the function's return value (following Frama-C/ACSL convention). It is only valid in `ensures` annotations. The `\` prefix distinguishes it from any TS variable named `result`.
 
-**`forall(k, P)`** infers the type of `k`: explicit `: nat` → `Nat`/`nat`; if `k` is used as a collection key or element (e.g., `map.has(k)`, `set.has(k)`, `arr.includes(k)`) → the collection's key/element type; otherwise `Int`/`int`. Same for `exists`.
+**`forall(k, P)`** accepts an optional explicit type annotation, which may be **any** type — `forall(k: nat, …)`, `forall(s: string, …)`, `forall(x: MyType, …)`. When `k` is unannotated, its type is inferred: if `k` is used as a collection key or element (e.g., `map.has(k)`, `set.has(k)`, `arr.includes(k)`) → the collection's key/element type; otherwise `Int`/`int`. Same for `exists`.
+
+**`perm(a, b)`** is a spec-only predicate holding iff arrays `a` and `b` are reorderings of each other (equal as multisets); both must be arrays of the same equality-supporting element type. It has no runtime counterpart, so it is rejected outside `//@` annotations. It lowers to Dafny's `multiset(a) == multiset(b)` (a transparent `Perm<T(==)>` predicate, so companion `.dfy` proofs can reason with `multiset` directly). **Dafny backend only** (`//@ backend dafny`). Canonical use: lifting a count's concatenation-homomorphism to permutation invariance. See [`examples/perm.ts`](examples/perm.ts).
 
 ### 2.3 Ghost Variables and Assertions
 
@@ -349,6 +355,37 @@ In brownfield `//@ verify` mode (§2.6), `//@ extern` declarations are still ext
 
 Bare-name `//@ extern` calls are classified as pure (since they emit as `function {:axiom}`), so they are not lifted out of enclosing expressions by the method-call-lifting pass (§3.6). This means a bare-name extern call can appear inside a lambda body without producing a multi-statement lambda. Dotted externs (cross-file `NS.method` calls) go through a separate dispatch and are also pure.
 
+**Dotted name.** Write `//@ extern fs.readFileSync` to give the extern a dotted name. A real `fs.readFileSync(...)` call in the code then resolves to this extern (§2.9) and is checked against its contract — so you can contract a library function directly, without writing a wrapper. Use a body-less `declare function` to carry the signature and the `//@ requires`/`//@ ensures`. (A function defined in the current file always wins over a same-named one in another file.)
+
+### 2.12 Auto-havoc: `//@ autohavoc`
+
+To verify a function, LemmaScript translates its whole body to the backend. That fails when the body mixes the property you care about (say, a path-traversal guard) with code that is out of model: framework I/O (`res.status()`, `req.query`), parsing (`JSON.parse`), env access (`process.env.X ?? y`), `uuidv4()`, anonymous object literals.
+
+`//@ autohavoc` makes such a function verifiable by replacing each out-of-model expression with an arbitrary value of its type (a `//@ havoc`, §2.10). The verifier then assumes nothing about those values and checks only what remains — the control flow and the contracts of the functions called. So it proves the property while ignoring the surrounding plumbing. It is the complement of `//@ extern` (§2.11): `extern` gives an out-of-model function a contract to reason *against*; `autohavoc` discards out-of-model code *entirely*.
+
+Enable it file-wide (a `//@ autohavoc` line at column 0) or on one function (next to its `//@ verify`). Dafny only (havoc is Dafny-only).
+
+```typescript
+app.get("/x", async (req, res) => {
+  //@ verify
+  //@ autohavoc
+  const id: string = req.query.id;                       // out of model → arbitrary string
+  const filePath = "./data/" + id + ".json";
+  if (!validPath(filePath)) return res.status(400);      // guard: kept and checked
+  return res.status(200).send(readFileSafe(filePath));   // readFileSafe contracted; its requires checked
+});
+```
+
+Here `req.query.id` and the `res.status(...).send(...)` calls are havoc'd away; the one thing verified is that `validPath` guards the contracted `readFileSafe` call.
+
+Three properties make this safe and useful:
+
+- **It cannot hide a failure.** Havoc over-approximates — the verifier considers *every* value an abstracted expression could take — so a proof can only *fail* under autohavoc, never spuriously pass. (The pass only havocs; it never `assume`s.)
+- **Contracts are still enforced.** A call to a function or extern with a `//@ requires` (a *sink*) is never discarded, even inside a havoc'd expression: it is pulled out to a `var _ := sink(...)` statement so its precondition is still checked, at any nesting depth.
+- **Discarded calls are reported**, so a sink you forgot to contract can't vanish silently. The pass prints every out-of-model call it abstracted — `autohavoc: get_x abstracts 2 external call(s) — confirm none is an unguarded sink: JSON.parse, uuidv4` — where a raw `fs.readFileSync` on a user path would show up for review.
+
+**Trust boundary:** the guarantee is "every *contracted* sink is reached only under its guard," not "every dangerous call is contracted." An out-of-model call with no contract is havoc'd (and reported); giving it a contract (§2.11) brings it under verification.
+
 ---
 
 ## 3. Spec Expression Translation
@@ -368,6 +405,7 @@ The translation is purely syntactic. `lsc` does not infer types beyond what `//@
 | `\|\|` | `∨` | `\|\|` |
 | `!` | `¬` | `!` |
 | `==>` | `→` | `==>` |
+| `<==>` | `↔` | `<==>` |
 | `+`, `-`, `*`, `/`, `%` | `+`, `-`, `*`, `/`, `%` | `+`, `-`, `*`, `/`, `%` |
 
 No normalization of operators. Both backends handle all comparison directions.
@@ -403,6 +441,8 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 | `s.indexOf(sub)` | `JSString.indexOf s sub` | `StringIndexOf(s, sub)` |
 | `s.indexOf(sub, from)` | — | `StringIndexOfFrom(s, sub, from)` (negative `from` clamps to 0) |
 | `s.slice(start, end)` | `JSString.slice s start end` | `s[start..end]` |
+| `s.substring(start)` / `s.substring(start, end)` | — | `s[start..]` / `s[start..end]` |
+| `s.charCodeAt(i)` | — | `(s[i] as int)` |
 | `s.trim()` | — | `StringTrim(s)` |
 | `s.trimEnd()` / `s.trimStart()` | — | `StringTrimRight(s)` / `StringTrimLeft(s)` |
 | `s.split(d)` (requires `\|d\| > 0`) | — | `StringSplit(s, d)` (axiomatic preamble: `1 <= \|res\| <= \|s\| + 1`) |
@@ -413,14 +453,18 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 | `s.endsWith(p)` | — | `\|s\| >= \|p\| && s[\|s\|-\|p\|..] == p` |
 | `s.length` | `s.length` | `\|s\|` |
 | `Math.max(...s)` / `Math.min(...s)` | — | `MaxOfSeq(s)` / `MinOfSeq(s)` (requires `\|s\| > 0`) |
-| `arr.map((x) => e)` | `arr.map (fun x => e)` | `Seq.Map((x) => e, arr)` |
-| `arr.filter((x) => e)` | `arr.filter (fun x => e)` | `Seq.Filter((x) => e, arr)` |
-| `arr.every((x) => e)` | `arr.all (fun x => e)` | `Seq.All(arr, (x) => e)` |
+| `perm(a, b)` (spec-only) | — | `Perm(a, b)` (preamble: `predicate Perm<T(==)>(a, b) { multiset(a) == multiset(b) }`) |
+| `arr.map((x) => e)` | `arr.map (fun x => e)` | `Std.Collections.Seq.Map((x) => e, arr)` |
+| `arr.filter((x) => e)` | `arr.filter (fun x => e)` | `Std.Collections.Seq.Filter((x) => e, arr)` |
+| `arr.every((x) => e)` | `arr.all (fun x => e)` | `Std.Collections.Seq.All(arr, (x) => e)` |
 | `arr.some((x) => e)` | `arr.any (fun x => e)` | `exists x :: x in arr && e` |
 | `arr.includes(x)` | `arr.contains x` | `(x in arr)` |
 | `arr.indexOf(x)` | — | `SeqIndexOf(arr, x)` (preamble) |
 | `arr.find((x) => e)` | `arr.find? (fun x => e)` | — |
 | `arr.findIndex((x) => e)` | — | `SeqFindIndex(arr, (x) => e)` (preamble: `-1 ⇔ no match`, `≥0 ⇔ first match with no earlier match`) |
+| `arr.findLast((x) => e)` | — | `SeqFindLast(arr, (x) => e)` (preamble) |
+| `arr.flat()` | — | `SeqFlatten(arr)` (preamble) |
+| `arr.join(sep)` | — | `SeqJoin(arr, sep)` (preamble) |
 | `arr.shift()` | — | `arr[0]` + `arr := arr[1..]` |
 | `arr.pop()` | — | `(if \|arr\|>0 then Some(arr[\|arr\|-1]) else None)` + `arr := (if \|arr\|>0 then arr[..\|arr\|-1] else arr)` |
 | `arr.slice(start)` | — | `arr[start..]` |
@@ -445,7 +489,7 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 | `const { [k]: _, ...rest } = map` | — | `var rest := (map k' \| k' in map && k' != k :: map[k'])` (desugared to `.delete()` in extract) |
 | `const [a, , c, ...rest] = arr` | — | `var a := arr[0]; var c := arr[2]; var rest := arr[3..]` (omits skipped, rest emits as slice) |
 | `arr.with(i, v)` | `arr.set! i v` | `arr[i := v]` |
-| `` `${n} items` `` (int+string) | — | `NatToString(n) + " items"` |
+| `` `${a}/${b}` `` (template literal) | `toString a ++ "/" ++ toString b` | `IntToString(a) + "/" + IntToString(b)` |
 | `{ k1: v1, ... }: Record<K,V>` | — | `map["k1" := v1, ...]` |
 | `new Map<K,V>()` | `Std.HashMap.empty` | `map[]` |
 | `Object.fromEntries(m)` | identity | identity |
@@ -456,6 +500,7 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 | `m.delete(k)` | `m := m.erase k` | `m := (map k' \| k' in m && k' != k :: m[k'])` |
 | `m.size` | `m.size` | `\|m\|` |
 | `new Set<T>()` | `Std.HashSet.empty` | `{}` |
+| `new Set(arr)` | `Std.HashSet.ofList arr.toList` | `(set x \| x in arr)` |
 | `s.has(x)` | `s.contains x` | `(x in s)` |
 | `x in S` | `x ∈ S` | `(x in S)` |
 | `s.add(x)` | `s := s.insert x` | `s := (s + {x})` |
@@ -581,9 +626,9 @@ The transform uses two strategies for translating `receiver.method(args)`:
 | `s.slice(start, end)` | `stringSlice` | `JSString.slice s start end` | `s[start..end]` |
 | `[...arr, e]` | `arrayPush` | `Array.push arr e` | `(arr + [e])` |
 | `arr.with(i, v)` | `arraySet` | `arr.set! i v` | `arr[i := v]` |
-| `arr.map(f)` | `map` | `arr.map f` | `Seq.Map(f, arr)` |
-| `arr.filter(f)` | `filter` | `arr.filter f` | `Seq.Filter(f, arr)` |
-| `arr.every(f)` | `every` | `arr.all f` | `Seq.All(arr, f)` |
+| `arr.map(f)` | `map` | `arr.map f` | `Std.Collections.Seq.Map(f, arr)` |
+| `arr.filter(f)` | `filter` | `arr.filter f` | `Std.Collections.Seq.Filter(f, arr)` |
+| `arr.every(f)` | `every` | `arr.all f` | `Std.Collections.Seq.All(arr, f)` |
 | `arr.some(f)` | `some` | `arr.any f` | `exists x :: x in arr && ...` |
 | `arr.includes(x)` | `includes` | `arr.contains x` | `(x in arr)` |
 | `arr.indexOf(x)` | `indexOf` | — | `SeqIndexOf(arr, x)` |
@@ -814,6 +859,8 @@ match pkt {
 **Detection:** ts-morph provides the variable's type (discriminated union), the discriminant field name, and the variant field types. `lsc` uses this — no guessing.
 
 **Field binding:** Property accesses on the matched variable (`pkt.seq`, `pkt.len`) become bound variables from the match pattern. Unused fields get `_`.
+
+**Switch fall-through:** a non-empty `case` must end in `break`/`return`/`throw` — C-style fall-through into the next case's body is rejected. Empty `case A: case B: body` stacking (leading labels sharing the next body) is supported.
 
 **Enum-like types** (string literal unions, no data fields) stay as `if` with constructor equality. Only discriminated unions with data fields trigger the if-chain → match transformation.
 
@@ -1174,9 +1221,14 @@ lsc gen [--backend=lean|dafny] <file.ts>      — generate verification artifact
 lsc check [--backend=lean|dafny] <file.ts>    — gen + verify
 lsc regen --backend=dafny <file.ts>           — regenerate with three-way merge (Dafny only)
 lsc extract <file.ts>                          — print Raw IR JSON (debugging)
+lsc info <file.ts>                             — write a JSON summary of verified functions (backend-neutral)
 ```
 
-Default backend is Dafny.
+Default backend is Dafny. `extract` and `info` are backend-neutral and always run, regardless of any `//@ backend` directive.
+
+**Flags** (passed through to the prover on `check`):
+- `--time-limit=<seconds>` — per-VC verification time limit (Dafny: `--verification-time-limit`).
+- `--extra-flags=<string>` — extra flags forwarded verbatim to the backend prover.
 
 ### 7.1 `gen`
 
@@ -1191,6 +1243,10 @@ Default backend is Dafny.
 ### 7.3 `regen` (Dafny only)
 
 Three-way merge when generated code changes. See [SPEC_DAFNY.md](SPEC_DAFNY.md).
+
+### 7.4 `info`
+
+Extract-only (no resolve/transform/emit). Writes `foo.ts.json` next to the source, mapping each top-level function and class method (`ClassName.method`) to its signature and original `//@ requires` / `//@ ensures` / `//@ decreases` clause text. Backend-neutral.
 
 ---
 
@@ -1211,6 +1267,6 @@ Each phase (and the three intermediate representations — Raw IR, Typed IR, IR)
 The following TS features are not yet handled by the toolchain:
 
 - Compound pattern matching (nested match on multiple discriminated unions)
-- async/await
+- `await` / true async — a `Promise<T>`-returning function with an `await` in its body is unmodellable. An `async` function with **no** `await` is supported: its `Promise<T>` return type is unwrapped to `T` (the wrapper is just calling convention), so the body verifies normally.
 - Error reporting (mapping prover errors to TS source locations)
 - VS Code extension
