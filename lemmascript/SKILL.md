@@ -20,7 +20,7 @@ LemmaScript compiles annotated TypeScript to Dafny for formal verification. The 
 ## Key Annotations
 
 ```typescript
-//@ verify              // opt function into verification
+//@ verify              // selective mode: verify ONLY marked fns (brownfield). Omit entirely for whole-file (greenfield).
 //@ requires <expr>     // precondition
 //@ ensures <expr>      // postcondition (\result = return value)
 //@ invariant <expr>    // loop invariant
