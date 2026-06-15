@@ -1,6 +1,6 @@
 ---
 name: lemmascript
-description: LemmaScript verification toolchain for TypeScript (Dafny backend only). Use when writing, annotating, generating, or verifying TypeScript code with LemmaScript, or when working on the Quorum domain model.
+description: LemmaScript verification toolchain for TypeScript (Dafny backend only). Use when writing, annotating, generating, or verifying TypeScript code with LemmaScript.
 ---
 
 # LemmaScript (Dafny Backend)
@@ -54,7 +54,7 @@ Single `domain.ts` with verified logic imported directly by React UI, hooks, and
 For the complete annotation grammar, type mapping rules, and backend-specific behavior, see [SPEC.md](SPEC.md) in this directory.
 
 ## Example
-One example of the domain.ts can be found in ../domain-example.ts
+One example of the domain.ts can be found in domain-example.ts
 Other case studies exist in the following public repos:
 - https://github.com/midspiral/equality-game-lemmascript/
 - https://github.com/midspiral/henri-lemmascript
