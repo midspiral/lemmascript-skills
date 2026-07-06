@@ -12,10 +12,10 @@ LemmaScript compiles annotated TypeScript to Dafny for formal verification. The 
 ## Workflow
 
 1. Write TypeScript with `//@` annotations
-2. Generate Dafny: `npx lsc gen --backend=dafny src/domain.ts`
+2. Generate Dafny: `lsc gen --backend=dafny src/domain.ts`
 3. Verify: `dafny verify src/domain.dfy`
 4. Iterate: fix annotations or add proof helpers in `.dfy`
-5. Regenerate (preserves proofs): `npx lsc regen --backend=dafny src/domain.ts`
+5. Regenerate (preserves proofs): `lsc regen --backend=dafny src/domain.ts`
 
 ## Key Annotations
 
