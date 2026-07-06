@@ -1,5 +1,5 @@
 ---
-name: verified-codebase
+name: lemmascript-verified-codebase
 description: This is a LemmaScript-verified codebase. All domain logic lives in domain.ts and is formally verified. Use this orientation when working on any part of the codebase that touches logic to avoid breaking the verification boundary.
 ---
 

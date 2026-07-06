@@ -51,7 +51,21 @@ Single `domain.ts` with verified logic imported directly by React UI, hooks, and
 
 ## Full Specification
 
-For the complete annotation grammar, type mapping rules, and backend-specific behavior, see [SPEC.md](SPEC.md) in this directory.
+For the complete annotation grammar, type mapping rules, and backend-specific behavior, see [reference/SPEC.md](reference/SPEC.md).
+
+## Reference: spec and compiler source
+
+`reference/` is a read-only snapshot of the LemmaScript release — the spec plus the compiler source. It is machine-maintained (synced from each release): never edit it. Edits there have no effect on the installed binary; if `lsc` seems wrong, that's a bug report or a version pin, not a local patch.
+
+When the spec doesn't answer why `lsc` emitted something, read the pipeline source in `reference/src/`:
+
+- `extract.ts` — TypeScript → Raw IR (what `lsc extract` prints)
+- `resolve.ts`, `narrow.ts` — name resolution and Option narrowing rules
+- `transform.ts` — IR → backend AST (`autohavoc.ts`, `peephole.ts` are companion passes)
+- `dafny-emit.ts` — Dafny text emission; `dafny-commands.ts` — the gen/check/regen loop
+- `lsc.ts` — CLI entry and commands
+
+If `lsc` is missing on PATH: `npm i -g lemmascript` (also provides `lsc claimcheck`, which vets `//@ contract` prose against the formal spec).
 
 ## Example
 One example of the domain.ts can be found in domain-example.ts

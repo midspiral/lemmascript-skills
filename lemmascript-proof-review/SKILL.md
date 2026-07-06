@@ -1,5 +1,5 @@
 ---
-name: proof-review
+name: lemmascript-proof-review
 description: Audit verified proofs against the design document. Run in a clean agent with no prior context. Reads domain.ts, domain.dfy, domain.dfy.gen, and DESIGN.md. Produces PROOF_FINDINGS.md. Does not change code.
 ---
 
