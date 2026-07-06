@@ -65,7 +65,7 @@ When the spec doesn't answer why `lsc` emitted something, read the pipeline sour
 - `dafny-emit.ts` — Dafny text emission; `dafny-commands.ts` — the gen/check/regen loop
 - `lsc.ts` — CLI entry and commands
 
-If `lsc` is missing on PATH: `npm i -g lemmascript` (also provides `lsc claimcheck`, which vets `//@ contract` prose against the formal spec).
+If `lsc` is missing on PATH: `npm i -g lemmascript`.
 
 ## Example
 One example of the domain.ts can be found in domain-example.ts
