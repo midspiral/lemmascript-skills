@@ -1,5 +1,5 @@
 ---
-name: design-doc
+name: lemmascript-design-doc
 description: Create a DESIGN.md for a LemmaScript-verified app. Use when starting a new verified app, translating requirements into a formal design, or when the user asks for a design document.
 ---
 
