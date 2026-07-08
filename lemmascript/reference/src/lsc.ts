@@ -78,7 +78,12 @@ function main() {
   const timeLimitIdx = args.findIndex(a => a.startsWith("--time-limit="));
   let timeLimit: number | undefined;
   if (timeLimitIdx >= 0) {
-    timeLimit = parseInt(args[timeLimitIdx].split("=")[1]);
+    const val = args[timeLimitIdx].split("=")[1];
+    if (!/^[1-9]\d*$/.test(val)) {
+      console.error(`Invalid --time-limit: ${val} (expected seconds as a positive integer)`);
+      process.exit(1);
+    }
+    timeLimit = parseInt(val);
     args.splice(timeLimitIdx, 1);
   }
 
@@ -96,6 +101,15 @@ function main() {
   if (slowIdx >= 0) {
     slow = true;
     args.splice(slowIdx, 1);
+  }
+
+  // Anything flag-shaped left over is a typo or a space-separated form
+  // (`--backend lean`): reject it rather than let it become a positional arg
+  // or be silently ignored (which would e.g. verify with the wrong backend).
+  const stray = args.find(a => a.startsWith("-"));
+  if (stray) {
+    console.error(`Unknown flag: ${stray} (flags take the form --flag=value, e.g. --backend=dafny)`);
+    process.exit(1);
   }
 
   const [cmd, filePath] = args;
@@ -243,7 +257,7 @@ function runFile(cmd: string, filePath: string, backend: "lean" | "dafny", timeL
       if (!dafnyVerify(dfyPath, dir, timeLimit, extraFlags)) process.exit(1);
       return;
     }
-    if (cmd === "regen") { dafnyRegen(genPath, dfyPath, basePath, text, dir); return; }
+    if (cmd === "regen") { dafnyRegen(genPath, dfyPath, basePath, text, dir, timeLimit, extraFlags); return; }
     console.error(`Unknown command: ${cmd}`);
     process.exit(1);
   }
