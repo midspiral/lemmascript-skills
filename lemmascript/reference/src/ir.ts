@@ -18,7 +18,7 @@ export type Expr =
   | { kind: "binop"; op: string; left: Expr; right: Expr }
   | { kind: "unop"; op: string; expr: Expr }
   | { kind: "app"; fn: string; args: Expr[]; ctorOf?: string }  // f a b; ctorOf set ⇒ fn is a datatype constructor of that (base) type. Dafny takes the bare name `fn(args)`; Lean must qualify it as `ctorOf.fn args`.
-  | { kind: "field"; obj: Expr; field: string; fromUnion?: string; ctor?: string }   // x.res, arr.size; fromUnion set ⇒ `field` is a destructor of that (base) discriminated-union type. Dafny reads `x.field` directly; Lean must `match` since multi-ctor inductives have no field projections. ctor pins the owning constructor when several variants share the field name.
+  | { kind: "field"; obj: Expr; field: string; fromUnion?: string; ctor?: string; datatypeField?: boolean }   // x.res, arr.size; fromUnion set ⇒ `field` is a destructor of that (base) discriminated-union type. Dafny reads `x.field` directly; Lean must `match` since multi-ctor inductives have no field projections. ctor pins the owning constructor when several variants share the field name. datatypeField set ⇒ `field` is a declared datatype field (proven by the transform), so the Dafny emitter projects it rather than treating `size`/`length`/`keys` as the collection intrinsic (`|obj|`, `.Keys`).
   | { kind: "toNat"; expr: Expr }                               // expr.toNat
   | { kind: "toReal"; expr: Expr }                             // int/nat → real coercion
   | { kind: "index"; arr: Expr; idx: Expr }                // arr[idx]!
@@ -38,8 +38,30 @@ export type Expr =
   | { kind: "havoc"; type: Ty }
   | { kind: "default"; type: Ty }                              // default value of T (Lean: `(default : T)` via Inhabited). Only produced by the return-in-loop→break rewrite, which is Lean-gated since Dafny keeps native in-loop returns; hence no Dafny producer today.
 
+/** A match-arm pattern. Backend-neutral: `.some x`, `.syn seq`, `.none` are held
+ *  structurally and rendered to each backend's constructor syntax by its emitter
+ *  (`Some(x)` / `syn(seq)` in Dafny, `.some x` / `.syn seq` in Lean). */
+export type MatchPattern =
+  | { kind: "wild" }                                    // "_"
+  | { kind: "ctor"; ctor: string; binders: string[] };  // ".some x" ⇒ {ctor:"some", binders:["x"]}; ".none" ⇒ binders:[]
+
+export const pWild = (): MatchPattern => ({ kind: "wild" });
+export const pCtor = (ctor: string, ...binders: string[]): MatchPattern => ({ kind: "ctor", ctor, binders });
+
+/** Binder identifiers a pattern introduces (`[]` for wildcard / nullary ctor). */
+export function patternBinders(p: MatchPattern): string[] {
+  return p.kind === "ctor" ? p.binders : [];
+}
+export function patternCtor(p: MatchPattern): string | null {
+  return p.kind === "ctor" ? p.ctor : null;
+}
+/** Does the pattern bind `name`? */
+export function patternBinds(p: MatchPattern, name: string): boolean {
+  return patternBinders(p).includes(name);
+}
+
 export interface MatchArm {
-  pattern: string;    // ".syn seq", ".idle", "_"
+  pattern: MatchPattern;
   body: Expr;
 }
 
@@ -63,7 +85,7 @@ export type Stmt =
   | { kind: "assert"; expr: Expr; assumed?: boolean }
 
 export interface StmtMatchArm {
-  pattern: string;
+  pattern: MatchPattern;
   body: Stmt[];
 }
 
@@ -254,8 +276,29 @@ export function usesNameInStmts(stmts: Stmt[], name: string): boolean {
   return anyExprInStmts(stmts, _refsName(name));
 }
 
-/** Does a declaration's spec (requires/ensures) or body reference `name`? The
- *  scope a method's out-parameter binder must dodge, shared by both emitters. */
+/** Names a statement tree *binds, targets, or introduces* — `let`/`let-bind`/
+ *  `ghostLet` names, `assign`/`bind`/`ghostAssign` targets, `for-in` indices,
+ *  and `match`-arm pattern binders — recursing through nested blocks. Distinct
+ *  from `usesNameInStmts` (expression references only): an unread or assign-only
+ *  local still duplicate-declares against a method's out-parameter in Dafny. */
+export function bindsNameInStmts(stmts: Stmt[], name: string): boolean {
+  return stmts.some(s => {
+    switch (s.kind) {
+      case "let": case "let-bind": case "ghostLet": return s.name === name;
+      case "assign": case "bind": case "ghostAssign": return s.target === name;
+      case "forin": return s.idx === name || bindsNameInStmts(s.body, name);
+      case "if": return bindsNameInStmts(s.then, name) || bindsNameInStmts(s.else, name);
+      case "while": return bindsNameInStmts(s.body, name);
+      case "match": return s.arms.some(a => patternBinds(a.pattern, name) || bindsNameInStmts(a.body, name));
+      default: return false;
+    }
+  });
+}
+
+/** Every occurrence of `name` a method's out-parameter binder must dodge —
+ *  referenced in a spec (requires/ensures) or body, *or* bound/targeted anywhere
+ *  in the body (an unread local still duplicate-declares). Both emitters share it. */
 export function usesNameInDecl(requires: Expr[], ensures: Expr[], body: Stmt[], name: string): boolean {
-  return requires.some(e => usesName(e, name)) || ensures.some(e => usesName(e, name)) || usesNameInStmts(body, name);
+  return requires.some(e => usesName(e, name)) || ensures.some(e => usesName(e, name))
+    || usesNameInStmts(body, name) || bindsNameInStmts(body, name);
 }
