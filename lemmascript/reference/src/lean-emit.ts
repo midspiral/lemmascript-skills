@@ -1,6 +1,8 @@
 /**
- * Lean emitter — IR → Lean text.
- * No logic, no type decisions — just serialization.
+ * Lean emitter — IR → Lean text. Beyond serialization it makes type-driven
+ * decisions: Bool-vs-Prop connectives, dropping Repr/DecidableEq for
+ * opaque-tainted types, discriminator/destructor lowering, method dispatch,
+ * and support-import selection.
  */
 
 import type { Expr, Stmt, Decl, Module, MatchPattern } from "./ir.js";
@@ -759,6 +761,21 @@ function emitPureExpr(e: Expr, indent: number): string {
 }
 
 // ── File emission ────────────────────────────────────────────
+
+/** Reset per-module emitter state. Call once per module before the types file
+ *  (not between types and def — the def file reads the types file's registries). */
+export function resetLeanModule(): void {
+  _resultName = "res";
+  _unionCtors.clear();
+  _opaqueNames.clear();
+  _opaqueNames.add("Unknown");
+  _typeRefs.clear();
+  _taintedTypes.clear();
+  _needsJSString = false;
+  _needsUnknown = false;
+  _unknownEmitted = false;
+  _boolCtx = false;
+}
 
 export function emitLeanFile(file: Module): string {
   _needsJSString = false;

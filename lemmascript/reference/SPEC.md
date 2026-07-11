@@ -1,6 +1,6 @@
 # LemmaScript — Implementation Specification
 
-**Version:** 0.5.14
+**Version:** 0.5.15
 **Date:** July 2026
 
 Backend-specific details:
@@ -404,7 +404,7 @@ The text is natural language, not a spec expression: the provers ignore it entir
 
 ## 3. Spec Expression Translation
 
-The translation is purely syntactic. `lsc` does not infer types beyond what `//@ type` annotations provide.
+The translation is largely syntactic, but also type-driven: lowerings such as truthiness coercion, `||` defaulting, and `/` (real vs integer division) are chosen from the operand's inferred type.
 
 ### 3.1 Operator Mapping
 
@@ -431,7 +431,7 @@ No normalization of operators. Both backends handle all comparison directions.
 
 `!!expr` works naturally: the inner `!` coerces to bool, the outer `!` negates.
 
-The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions: `n` (number) → `n > 0`, `xs` (array) → `|xs| > 0`, `s` (string) → `|s| > 0`. Optional conditions are handled separately (see Optional narrowing).
+The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions: `n` (number) → `n != 0` (every nonzero number is truthy, including negatives), `xs` (array) → `true` (every array is truthy in JS, even `[]`), `s` (string) → `|s| > 0`. Optional conditions are handled separately (see Optional narrowing).
 
 ### 3.2 Special Forms
 
@@ -478,17 +478,18 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 | `arr.findIndex((x) => e)` | — | `SeqFindIndex(arr, (x) => e)` (preamble: `-1 ⇔ no match`, `≥0 ⇔ first match with no earlier match`) |
 | `arr.findLast((x) => e)` | — | `SeqFindLast(arr, (x) => e)` (preamble) |
 | `arr.flat()` | — | `SeqFlatten(arr)` (preamble) |
-| `arr.join(sep)` | — | `SeqJoin(arr, sep)` (preamble) |
+| `arr.join(sep)` | `(String.intercalate sep arr.toList)` | `SeqJoin(arr, sep)` (preamble) |
 | `arr.shift()` | — | `arr[0]` + `arr := arr[1..]` |
 | `arr.pop()` | — | `(if \|arr\|>0 then Some(arr[\|arr\|-1]) else None)` + `arr := (if \|arr\|>0 then arr[..\|arr\|-1] else arr)` |
-| `arr.unshift(e)` | — | `([e] + arr)` (mutating → reassignment) |
+| `arr.unshift(e)` | `(#[e] ++ arr)` (mutating → reassignment) | `([e] + arr)` (mutating → reassignment) |
 | `arr.sort(cmp)` | — | `SeqSortBy(arr, cmp)` (preamble axiom: permutation + length-preserving + sorted; mutating; `requires` cmp a total preorder) |
-| `arr.slice(start)` | — | `arr[start..]` |
-| `arr.slice(start, end)` | — | `arr[start..end]` |
+| `arr.slice(start)` | `arr.extract start arr.size` | `arr[start..]` |
+| `arr.slice(start, end)` | `arr.extract start end` | `arr[start..end]` |
 | `expr!` (non-null) | unwrap Option | unwrap Option / direct map access |
 | `expr \|\| default` (on optional) | match Some/None | `match { Some(v) => v, None => default }` |
 | `expr \|\| undefined` (on optional) | identity | identity (no-op) |
-| `expr \|\| default` (on string/array) | if non-empty | `if \|expr\| > 0 then expr else default` |
+| `expr \|\| default` (on string) | if non-empty | `if \|expr\| > 0 then expr else default` |
+| `expr \|\| default` (on array) | `expr` (arrays are always truthy) | `expr` (arrays are always truthy) |
 | `expr?.method(args)` | — | `if key in map { ... }` |
 | `expr as T` | stripped | stripped |
 | `null` | `none` | `None` (same as `undefined`) |
@@ -1237,17 +1238,21 @@ Both backends generate `match` for the body and ensures. Both verify automatical
 
 ```
 lsc gen [--backend=lean|dafny] <file.ts>      — generate verification artifacts
+lsc gen-check [--backend=dafny] <file.ts>     — gen + additions-only check, no verify (Dafny only)
 lsc check [--backend=lean|dafny] <file.ts>    — gen + verify
 lsc regen --backend=dafny <file.ts>           — regenerate with three-way merge (Dafny only)
 lsc extract <file.ts>                          — print Raw IR JSON (debugging)
 lsc info <file.ts>                             — write a JSON summary of verified functions (backend-neutral)
+lsc claimcheck [<file.ts>]                     — check //@ contract prose vs //@ ensures (forwards to lemmascript-claimcheck)
 ```
 
-Default backend is Dafny. `extract` and `info` are backend-neutral and always run, regardless of any `//@ backend` directive.
+Default backend is Dafny. `extract` and `info` are backend-neutral and always run, regardless of any `//@ backend` directive. With no `<file.ts>`, `gen`, `gen-check`, and `check` batch over the files listed in `LemmaScript-files.txt`.
 
-**Flags** (passed through to the prover on `check`):
+**Flags:**
+- `--backend=lean|dafny` — select the backend (default Dafny).
 - `--time-limit=<seconds>` — per-VC verification time limit (Dafny: `--verification-time-limit`).
 - `--extra-flags=<string>` — extra flags forwarded verbatim to the backend prover.
+- `--slow` — in batch mode, run full `check` even on entries whose `LemmaScript-files.txt` timeout exceeds 60s (otherwise those degrade to `gen-check`).
 
 ### 7.1 `gen`
 
