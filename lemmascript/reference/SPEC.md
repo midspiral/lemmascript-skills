@@ -1,6 +1,6 @@
 # LemmaScript — Implementation Specification
 
-**Version:** 0.5.15
+**Version:** 0.5.16
 **Date:** July 2026
 
 Backend-specific details:
@@ -428,10 +428,11 @@ No normalization of operators. Both backends handle all comparison directions.
 - `string`: `!s` → `s == ""` (empty string is falsy)
 - `optional`: `!opt` → match on None (undefined is falsy)
 - `bool`: `!b` → `¬b` (standard negation)
+- `array` / object (user type) / `map` / `set`: always truthy in JS, so `!x` → `false`
 
 `!!expr` works naturally: the inner `!` coerces to bool, the outer `!` negates.
 
-The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions: `n` (number) → `n != 0` (every nonzero number is truthy, including negatives), `xs` (array) → `true` (every array is truthy in JS, even `[]`), `s` (string) → `|s| > 0`. Optional conditions are handled separately (see Optional narrowing).
+The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions: `n` (number) → `n != 0` (every nonzero number is truthy, including negatives), `xs` (array), an object (user type), a `map`, or a `set` → `true` (all truthy in JS, even `[]`/`{}`), `s` (string) → `|s| > 0`. Optional conditions are handled separately (see Optional narrowing).
 
 ### 3.2 Special Forms
 
@@ -961,13 +962,16 @@ The spec body is purely additive — `regen` three-way-merges and preserves user
 | `Record<K, V>` | `Std.HashMap K' V'` | `map<K', V'>` |
 | `(a: T1, b: T2) => R` (function type) | — | `(T1, T2) -> R` (typically used in a `type Foo = (...) => R` alias; lambda params passed to a callee with a `Foo`-typed parameter get inferred types) |
 | `unknown` | `Int` | `int` |
-| `[T, T, ...]` (tuple) | `Array T'` | `seq<T'>` |
+| `[A, B, ...]` (heterogeneous tuple) | `A' × B' × ...` | `(A', B', ...)` |
+| `[T, T, ...]` (homogeneous tuple) | `Array T'` | `seq<T'>` |
 | `<T extends Base>` (record/nominal bound) | `T` erased to `Base` | `T` erased to `Base` |
 | `<T>` / `<T extends U>` (unbounded, or union/intersection bound) | `T` kept as type param (bound dropped) | `T` kept as type param (bound dropped) |
 | `A \| B` (union param) | field intersection type | field intersection type |
 | Anything else | Pass through | Pass through |
 
 `lsc` reads parameter and variable types from ts-morph. Primitive types are mapped per the table. User-defined types (like `State`, `Event`) are passed through by name — the corresponding backend type is generated from the TS type declaration.
+
+**Tuples.** A tuple type lowers to a native backend tuple (`(A, B)` in Dafny, `A × B` in Lean) only when its element types differ; a *homogeneous* tuple (`[number, number]`) lowers to `seq`/`Array` instead, since a sequence is a superset of what a same-typed tuple offers (dynamic index, `.length`, `.map`). The same homogeneity rule applies to an unannotated array literal: `[1, "a"]` is a tuple, `[1, 2, 3]` a sequence; an explicit expected type wins. Tuple element access **requires a compile-time integer-literal index** — `t[0]`, `t[1]` — because a tuple has a distinct type per slot, so a runtime index has neither a single result type nor a backend projection (`t.0`/`t.1`). A non-literal index into a tuple is a `lsc` error. `const [a, b] = t` destructuring works (it desugars to per-slot access). See [`examples/tuples.ts`](examples/tuples.ts).
 
 ### 6.1.1 BigInt
 
