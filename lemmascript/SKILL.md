@@ -115,7 +115,7 @@ import opened Std.Arithmetic.DivMod
 
 - **Never edit `reference/`.** It is a machine-synced, read-only snapshot of the release (spec + compiler source). Edits there have no effect on the installed binary.
 - **Never patch the installed `lemmascript` package or a local compiler checkout** unless the user explicitly asks. A suspected `lsc`/compiler bug is a bug report, not a local patch (see the upstream-issues skill). Workarounds belong in your `.ts`/`.dfy`, never in the tool.
-- If you find a suspected bug, minimize a repro and optionally (only with user consent) file an issue or PR against [midspiral/LemmaScript](https://github.com/midspiral/LemmaScript). See the [lemmascript-upstream-issues](../lemmascript-upstream-issues/SKILL.md) skill for the workflow.
+- If you find a suspected bug, minimize a repro and optionally (only with user consent) file an issue or PR against [midspiral/LemmaScript](https://github.com/midspiral/LemmaScript). 
 
 ## Reference
 
