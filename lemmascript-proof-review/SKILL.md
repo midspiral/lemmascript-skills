@@ -1,6 +1,6 @@
 ---
 name: lemmascript-proof-review
-description: Audit verified LemmaScript proofs against the design document. Run in a clean agent with no prior context. Re-verifies with lsc check, inventories the trust surface (assume/havoc/extern/skip/autohavoc/selective verify), checks //@ contract coverage and claimcheck artifacts, and produces PROOF_FINDINGS.md. Does not change code.
+description: Milestone audit of verified LemmaScript proofs against the design document — run at a stopping point (before release, sealing, or making external claims; after a major proof push), not in the edit-prove loop. Runs in a clean agent with no prior context, after lsc check is green and claimcheck has been run. Re-verifies, inventories the trust surface (assume/havoc/extern/skip/autohavoc/selective verify), checks //@ contract coverage and claimcheck artifacts, and produces PROOF_FINDINGS.md. Does not change code.
 ---
 
 # Proof Review
@@ -11,6 +11,30 @@ scratch and produces an independent assessment. An example report is in this
 folder (`PROOF_FINDINGS.md`); it illustrates the format and tone, but predates
 the Trust Surface and Intent Coverage sections below — follow the structure
 here, not the example's.
+
+## When to run
+
+This is a **milestone audit**, not an inner-loop check. It sits at the end of
+the chain, after the cheaper gates have already passed:
+
+1. `lsc check` green — code ⊨ spec (every edit; the inner loop)
+2. `lsc claimcheck` clean — spec ⊨ intent, per function (when annotations change)
+3. **Proof review** — the whole chain ⊨ the product promise (at stopping points)
+
+Run it when the answer matters and the state is stable:
+
+- Before making an **external claim** about what's verified (README, marketing,
+  a customer conversation) — Safe External Wording is the deliverable
+- Before a **release or sealing** the verified files
+- After a **major proof push** lands (a new property family, a stage of the
+  design doc's roadmap flips to "verified")
+- When the **design doc changes materially** — the claims table is stale the
+  moment the promise moves
+
+Do not run it per-edit or per-proof-iteration: it re-reads everything from
+scratch by design, so its cost is only justified when the codebase is at a
+stopping point. Findings between audits belong in the loop (fix the proof,
+re-run claimcheck), not in a fresh PROOF_FINDINGS.md.
 
 ## Instructions
 
