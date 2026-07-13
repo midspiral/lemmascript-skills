@@ -73,7 +73,7 @@ The `.ts` is the source of truth for **the program**; the `.dfy` is the source o
 
 **Additions-only trap.** Appending a trailing comment to a generated line (e.g. `{  // note`) counts as a *modified* line and fails the gate — put comments on their own new line.
 
-**Regen, don't rm.** Do not `rm *.dfy* && lsc gen` — that drops every proof addition. `regen` does a three-way merge and preserves them. If a .ts is heavily modified and  differs significantly 
+**Regen, don't rm.** Do not `rm *.dfy* && lsc gen` — that drops every proof addition. `regen` does a three-way merge and preserves them. 
 
 **Stale `.dfy.base` cascade.** A failed `regen` (CONFLICT or verification FAILED) leaves a stale `foo.verify.dfy.base` on disk; the next `regen` anchors on it and mis-merges, appending duplicate declarations → a cascade of `Error: Duplicate member name: ...`. Fix: `rm -f *.dfy.base` and regen again. Keep `*.dfy.base` out of version control.
 
