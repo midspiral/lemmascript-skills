@@ -1,22 +1,34 @@
 ---
 name: lemmascript-proof-review
-description: Audit verified proofs against the design document. Run in a clean agent with no prior context. Reads domain.ts, domain.dfy, domain.dfy.gen, and DESIGN.md. Produces PROOF_FINDINGS.md. Does not change code.
+description: Audit verified LemmaScript proofs against the design document. Run in a clean agent with no prior context. Re-verifies with lsc check, inventories the trust surface (assume/havoc/extern/skip/autohavoc/selective verify), checks //@ contract coverage and claimcheck artifacts, and produces PROOF_FINDINGS.md. Does not change code.
 ---
 
 # Proof Review
 
 Audit the verified domain proofs against the design document. This skill is
-designed to run in a **fresh agent with no context** — it reads all files from scratch and produces an independent assessment. An example can be found in this folder: PROOF_FINDINGS.md
+designed to run in a **fresh agent with no context** — it reads all files from
+scratch and produces an independent assessment. An example report is in this
+folder (`PROOF_FINDINGS.md`); it illustrates the format and tone, but predates
+the Trust Surface and Intent Coverage sections below — follow the structure
+here, not the example's.
 
 ## Instructions
 
-1. Read these files in order:
-   - `DESIGN.md` (the spec: what was promised)
-   - `src/domain.ts` (the annotated TypeScript: what was written)
-   - `src/domain.dfy.gen` (the generated Dafny: what LemmaScript produced)
-   - `src/domain.dfy` (the working Dafny: what proofs were added)
+1. Read these, in order:
+   - The design document (the spec: what was promised)
+   - Every verified `.ts` file — the project's `LemmaScript-files.txt` lists
+     them; otherwise glob for files with `//@` annotations
+   - For each verified file, its `.dfy.gen` (what LemmaScript produced) and
+     `.dfy` (what proofs were added)
+   - Any `*.guarantees.{json,md}` claimcheck artifacts, if present
 
-2. Run `dafny verify src/domain.dfy` and record the result.
+2. Re-verify with `lsc check` — with no file argument it batches over
+   `LemmaScript-files.txt`; otherwise run it per file. Record the result.
+   **Do not substitute raw `dafny verify`**: it can pass on a stale `.dfy`
+   that no longer corresponds to the current `.ts`, certifying proofs about
+   code that isn't the code. `lsc check` regenerates, enforces the
+   additions-only gate, and then verifies — that is the only honest baseline
+   for an audit.
 
 3. Produce `PROOF_FINDINGS.md` in the project root. Do not modify any code.
 
@@ -32,12 +44,56 @@ One subsection per verified property family. For each:
 - Note important limitations or caveats
 - Distinguish between what the proof says and what the design doc claims
 
+### Trust Surface Inventory
+Everything that weakens or bypasses the verification model, each with its
+justification or a flag. The annotation semantics live in the shipped
+`reference/SPEC.md` (§ references below); consult its §2.1 table for the
+full current annotation surface — don't assume this list is complete:
+
+- `//@ assume` — bypasses a proof obligation (SPEC §2.3). Legitimate use is
+  constraining a `//@ havoc`'d value; anything else deserves scrutiny.
+- `//@ havoc` / `//@ havoc <key>` — value replaced by nondeterminism (§2.10)
+- `//@ extern` — body replaced by an axiom (§2.11)
+- Cross-file calls — auto-externed as opaque axioms (§2.9); the proof rests
+  on the callee's *own* verification, so state which callees are trusted
+- `//@ skip` — statement dropped from the model
+- `//@ autohavoc` — every unmodellable expression havoc'd (§2.12)
+- Selective `//@ verify` mode (§2.6) — **the silent one**: if any function in
+  a file has `//@ verify`, every unmarked function is skipped entirely.
+  "N verified, 0 errors" can hide that half the domain was never in the
+  model. State what fraction of each file is actually verified.
+- `//@ backend` (§2.7) — a file restricted to another backend is silently
+  skipped under the current one; report any such files as unverified here
+
+### Intent Coverage
+The formal spec can verify and still not mean what the prose claims. Report:
+- `//@ contract` coverage: which verified functions have a formal spec
+  (`ensures`) but **no** `//@ contract`? Their specs have never been vetted
+  against any stated intent — list them.
+- If claimcheck artifacts (`*.guarantees.{json,md}`) exist: are they fresh
+  (verdicts are a pure function of the annotation text — compare the
+  contracts/requires/ensures in the artifact against the current source)?
+  Fold any **disputed** or **gap** verdicts into the findings.
+- If no claimcheck artifact exists, report that as a finding. Do **not** run
+  `lsc claimcheck` yourself — it needs an LLM backend and spends tokens; the
+  review is a read-only audit.
+
 ### Design-Doc Claims: Status Table
-A table mapping each claim from DESIGN.md §2 (the promise) and §7 (properties)
-to one of:
+A table mapping each claim from the design doc's *promise* section and its
+*properties catalog* (whatever sections play those roles — don't assume
+numbering) to one of:
 - **Supported**: proof matches the claim
 - **Partially supported**: proof covers part of the claim; state what's missing
 - **Not yet supported**: no proof; state what would be needed
+
+Before marking a claim **Supported**, check it isn't vacuous:
+- Is the `requires` satisfiable? A contract with an unsatisfiable
+  precondition verifies everything and guarantees nothing.
+- Is the `ensures` non-trivial — could it hold for a wrong implementation?
+- **Co-vacuity**: were the design claim and the formal spec derived from the
+  same guess? Two artifacts that agree can both be wrong; an independent
+  fresh-context review exists precisely to catch this. Re-derive what the
+  property *should* say from the product intent before comparing.
 
 ### Main Gaps
 Numbered list of what's missing before the full product promise can be made.
@@ -54,15 +110,14 @@ what should NOT be claimed yet.
   Proofs are about the Dafny model. The TypeScript runs the same logic but
   the trust boundary is the TS→Dafny translation.
 - Distinguish between:
-  - What the invariant (`wellFormed`) actually includes vs what the design says it should
+  - What the invariant actually includes vs what the design says it should
   - What an `ensures` clause says vs what the design doc's spec sketch says
-  - What's proven for the implemented model vs what the design defers to trusted shell
-- Call out any `//@ assume` usage (these bypass proof obligations).
-- Call out any `//@ havoc` usage (these mark code as unverified).
-- Note if `wellFormed` is weaker than DESIGN.md's stated invariant conditions.
-- Note if any property family from DESIGN.md has no corresponding verified function.
+  - What's proven for the implemented model vs what the design defers to
+    trusted shell code
+- Note if any property family from the design doc has no corresponding
+  verified function.
 - If the design doc lists staged proofs with status markers, check that the
-  "verified" stages actually verify (they're in the .dfy and pass).
+  "verified" stages actually verify (they're in the `.dfy` and pass).
 
 ## Tone
 
