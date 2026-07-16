@@ -1,0 +1,63 @@
+# Kit bump: on every push to main, advance the lemmascript-kit superproject's
+# `.claude/skills` submodule to this commit, so the kit tracks tip. This fires on
+# ordinary skill edits AND on the per-release reference sync that LemmaScript's
+# release-sync.yml commits here. The LemmaScript repo has a mirror kit-bump.yml
+# that advances the `LemmaScript` submodule. See LemmaScript DESIGN_NPM.md §3.
+#
+# Requires the SYNC_TOKEN secret in THIS repo: a fine-grained PAT with Contents
+# read/write on midspiral/lemmascript-kit (the same token used in the LemmaScript
+# repo — its scope already covers the kit). Set with:
+#   gh secret set SYNC_TOKEN -R midspiral/lemmascript-skills
+name: Kit bump
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Skills commit to pin (default: latest main)'
+        required: false
+
+# Serialize this repo's bumps; the cross-repo race with LemmaScript's bumper is
+# handled by the rebase-retry loop below.
+concurrency:
+  group: kit-bump-skills
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve commit
+        id: rev
+        run: echo "sha=${{ github.event.inputs.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump kit .claude/skills submodule
+        env:
+          SHA: ${{ steps.rev.outputs.sha }}
+        run: |
+          git clone "https://x-access-token:${{ secrets.SYNC_TOKEN }}@github.com/midspiral/lemmascript-kit.git" kit
+          cd kit
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git submodule update --init -- .claude/skills
+          git -C .claude/skills fetch origin "$SHA"
+          git -C .claude/skills checkout "$SHA"
+          git add .claude/skills
+          if git diff --cached --quiet; then
+            echo "kit already at ${SHA} — nothing to bump"
+            exit 0
+          fi
+          git commit -m "bump submodule: .claude/skills ${SHA}"
+          # The LemmaScript bumper may push to the kit concurrently; rebase and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            echo "push rejected (attempt ${attempt}); rebasing on latest kit main"
+            git pull --rebase origin main
+          done
+          echo "ERROR: could not push kit bump after retries" >&2
+          exit 1
