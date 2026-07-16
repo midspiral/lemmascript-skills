@@ -192,6 +192,14 @@ let _opts: TransformOptions = DAFNY_OPTIONS;
 /** Type declarations — set once per module transform for discriminated union handling. */
 let _typeDecls: TypeDeclInfo[] = [];
 
+/** Names of functions that get a `Pure.` mirror (Lean). A bare reference to one
+ *  in a higher-order position resolves to the monadic method, so it must be
+ *  redirected to the pure mirror. Set once per module transform. */
+let _pureDefNames: Set<string> = new Set();
+
+/** Array methods that take a function argument. */
+const HOF_METHODS = new Set(["map", "filter", "every", "some", "find", "findLast", "findIndex", "findLastIndex", "reduce"]);
+
 /** Prefix match-bound field names to avoid capturing user variables.
  *  When prefix is given (the scrutinee name), include it to avoid
  *  collisions in nested matches on different variables. `freshName` closes
@@ -335,7 +343,8 @@ function coerceCondToBool(cond: Expr, ty: Ty): Expr {
     return { kind: "binop", op: "≠", left: cond, right: { kind: "num", value: 0 } };
   if (ty.kind === "string")
     return { kind: "binop", op: ">", left: { kind: "field", obj: cond, field: "length" }, right: { kind: "num", value: 0 } };
-  if (ty.kind === "array")
+  // Arrays, objects, maps, sets, tuples are always truthy in JS (even `[]`/`{}`).
+  if (["array", "user", "map", "set", "tuple"].includes(ty.kind))
     return { kind: "bool", value: true };
   return cond;
 }
@@ -602,6 +611,13 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
           else: { kind: "var", name: "undefined" },
         };
       }
+      // || on a number → `if x != 0 then x else default` (0 the only falsy int).
+      if (e.op === "||" && (e.left.ty.kind === "int" || e.left.ty.kind === "nat")) {
+        const left = lowerExpr(e.left, binds);
+        const right = lowerExpr(e.right, binds);
+        const truthy = valueTruthyCond(left, e.left.ty)!;
+        return { kind: "if", cond: truthy, then: left, else: right };
+      }
       // String concatenation: `+` with a string operand. Stringify int/nat
       // operands (Dafny NatToString, Lean toString) and join with arrayConcat
       // (rendered `+` in Dafny, `++` in Lean).
@@ -766,8 +782,15 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       if (e.fn.kind === "field") {
         const recv = lowerExpr(e.fn.obj, binds);
         let method = e.fn.field;
+        const isHOF = e.fn.obj.ty.kind === "array" && HOF_METHODS.has(method);
         const args = e.args.map((a, i) => {
           const lowered = lowerExpr(a, binds);
+          // Lean: a pure fn passed to a HOF by name resolves to the monadic
+          // method; redirect to its pure `Pure.` mirror.
+          if (_opts.backend === "lean" && isHOF &&
+              lowered.kind === "var" && _pureDefNames.has(lowered.name)) {
+            return { kind: "var" as const, name: `Pure.${lowered.name}` };
+          }
           // Array index args must be nat in Lean: `with`'s index (0), includes/indexOf `from` (1).
           const isArrIdxArg = e.fn.kind === "field" && e.fn.obj.ty.kind === "array" &&
             ((e.fn.field === "with" && i === 0) || ((e.fn.field === "includes" || e.fn.field === "indexOf") && i === 1));
@@ -2183,6 +2206,7 @@ export function transformModule(mod: TModule, specImport?: string, moduleBaseOve
   _forofCounters.clear();
   _liftCounter = 0;
   _typeDecls = mod.typeDecls;
+  _pureDefNames = new Set(mod.functions.filter(f => f.isPure).map(f => f.name));
   const typeDecls = mod.typeDecls.map(transformTypeDecl);
 
   // Module-level constants

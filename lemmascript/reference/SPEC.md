@@ -167,7 +167,7 @@ When imported types can't be resolved by ts-morph (e.g., in monorepos with bundl
 //@ declare-type Rect { x: number, y: number, width: number, height: number }
 ```
 
-Each `declare-type` generates a Dafny `datatype` (or Lean `structure`) with the given fields. Field types use TS syntax (`number`, `string`, `boolean`, `T[]`, etc.) and are mapped through the standard type rules (§6.1).
+Each `declare-type` generates a Dafny `datatype` (or Lean `structure`) with the given fields. Fields separate on `,` or `;` (TS object types accept either). Field types use TS syntax (`number`, `string`, `boolean`, `T[]`, etc.) and are mapped through the standard type rules (§6.1).
 
 Place `declare-type` annotations before the first function that uses the type. They can appear as leading comments on any statement. `declare-type` takes precedence over any type/interface of the same name in the source file, and is never filtered out by brownfield mode.
 
@@ -478,18 +478,21 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 | `arr.find((x) => e)` | `arr.find? (fun x => e)` | — |
 | `arr.findIndex((x) => e)` | — | `SeqFindIndex(arr, (x) => e)` (preamble: `-1 ⇔ no match`, `≥0 ⇔ first match with no earlier match`) |
 | `arr.findLast((x) => e)` | — | `SeqFindLast(arr, (x) => e)` (preamble) |
+| `arr.findLastIndex((x) => e)` | — | `SeqFindLastIndex(arr, (x) => e)` (preamble: `-1 ⇔ no match`, `≥0 ⇔ last match with no later match`) |
 | `arr.flat()` | — | `SeqFlatten(arr)` (preamble) |
 | `arr.join(sep)` | `(String.intercalate sep arr.toList)` | `SeqJoin(arr, sep)` (preamble) |
 | `arr.shift()` | — | `arr[0]` + `arr := arr[1..]` |
 | `arr.pop()` | — | `(if \|arr\|>0 then Some(arr[\|arr\|-1]) else None)` + `arr := (if \|arr\|>0 then arr[..\|arr\|-1] else arr)` |
 | `arr.unshift(e)` | `(#[e] ++ arr)` (mutating → reassignment) | `([e] + arr)` (mutating → reassignment) |
 | `arr.sort(cmp)` | — | `SeqSortBy(arr, cmp)` (preamble axiom: permutation + length-preserving + sorted; mutating; `requires` cmp a total preorder) |
+| `arr.sort()` (no comparator) | — | `SeqSort(arr)` (preamble axiom: permutation + length-preserving only — JS default order is type-dependent) |
 | `arr.slice(start)` | `arr.extract start arr.size` | `arr[start..]` |
 | `arr.slice(start, end)` | `arr.extract start end` | `arr[start..end]` |
 | `expr!` (non-null) | unwrap Option | unwrap Option / direct map access |
 | `expr \|\| default` (on optional) | match Some/None | `match { Some(v) => v, None => default }` |
 | `expr \|\| undefined` (on optional) | identity | identity (no-op) |
 | `expr \|\| default` (on string) | if non-empty | `if \|expr\| > 0 then expr else default` |
+| `expr \|\| default` (on number) | if nonzero | `if expr != 0 then expr else default` |
 | `expr \|\| default` (on array) | `expr` (arrays are always truthy) | `expr` (arrays are always truthy) |
 | `expr?.method(args)` | — | `if key in map { ... }` |
 | `expr as T` | stripped | stripped |
@@ -683,7 +686,8 @@ enqueued.add(id);        // → Lean: enqueued := enqueued.insert id
 
 - Equality: `v !== undefined`, `v === undefined` (early return)
 - Truthiness: `if (v)`, `if (!v)`, `opt ? a : b`
-- Composition: `v && rest` or `rest && v` (optional check on either side) — in an `if`/`?:` condition or as a bare statement (`v !== undefined && v.f()`, the `if`-less guard idiom); `a === undefined || b === undefined`
+- Composition: `v && rest` or `rest && v` (optional check on either side) — in an `if`/`?:` condition or as a bare statement (`v !== undefined && v.f()`, the `if`-less guard idiom)
+- Disjunctive early return: `a === undefined || b === undefined`, `!x || x.f !== v`, `x?.t !== 'm' || x.g`
 - Spec implication: `path !== undefined && rest ==> B` (premise narrows conclusion)
 - Optional chaining: `obj?.field`, `obj?.foo()`, `obj?.[i]`, chained `obj?.a?.b?.c` and `obj?.a.b.c`
 - Nullish coalescing: `x ?? default`; array index `arr[i] ?? default` (undefined ⟺ out of bounds under `noUncheckedIndexedAccess`) → `(0 <= i && i < arr.length) ? arr[i] : default`
