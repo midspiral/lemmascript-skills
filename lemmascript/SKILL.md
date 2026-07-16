@@ -36,7 +36,7 @@ Naming convention (recommended but not enforced -- a user can override by reques
 
 ### Filesystem layout
 
-Two ways to set up the verified code. Either way, the generated `.dfy.gen` and proof `.dfy` sit **next to** their `.verify.ts`, and the unverified shell (UI, hooks, edge/server functions, I/O) imports the verified functions **directly — no adapter layer**.
+Two ways to set up the verified code. Either way, the generated `.dfy.gen` and proof `.dfy` sit **next to** their `.verify.ts`, and the unverified shell (UI, hooks, edge/server functions, I/O) typically imports the verified functions **directly — no adapter layer**. Exceptions on the user's request: runtime checks at the boundary (e.g. `lemmascript-guard`, the runtime guard plugin, works through a wrapper) or an explicitly requested wrapper.
 
 **Single-file** — all verified logic in one module. Simplest; good for one cohesive domain.
 

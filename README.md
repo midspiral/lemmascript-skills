@@ -7,7 +7,7 @@ Agent skills for the [LemmaScript](https://github.com/midspiral/LemmaScript) too
 - **`lemmascript`** — the core skill: annotation grammar, the gen/verify/regen workflow, and `reference/` (see below).
 - **`lemmascript-design-doc`** — create a DESIGN.md for a verified app.
 - **`lemmascript-proof-review`** — audit verified proofs against the design document.
-- **`lemmascript-verified-codebase`** — orientation for working inside a verified codebase without breaking the verification boundary.
+- **`lemmascript-verified-codebase-rules`** — rules that bind any change (UI, API, refactor) in a codebase containing verified files, so the verification boundary doesn't erode. (Replaces the deprecated `lemmascript-verified-codebase`.)
 
 All shipped skills are `lemmascript*`-prefixed: consumers can keep their own skills alongside without collisions, and ownership is legible in a directory listing.
 
