@@ -6,11 +6,15 @@
  */
 
 import type { TExpr, TStmt, TFunction, TModule, Ty } from "./typedir.js";
+import { tyEqual } from "./typedir.js";
 import type { Expr, Stmt, Decl, Module, FnDef, FnDefByMethod, FnMethod, MatchArm, StmtMatchArm, ConstDecl, MatchPattern } from "./ir.js";
 import { anyExprInStmts, pWild, pCtor, patternBinders, patternBinds, patternCtor } from "./ir.js";
-import type { TypeDeclInfo } from "./types.js";
+import type { TypeDeclInfo, VariantInfo } from "./types.js";
 import { parseTsType } from "./types.js";
 import { freshName } from "./names.js";
+import { builtinSpec } from "./builtins.js";
+import { isFalsyCapableTy } from "./condition-facts.js";
+import { declOf, declOfKind, declOfTy, unionDeclOfTy, declWithVariant, tyBaseName } from "./typedecls.js";
 
 // ── Generic IR walkers ──────────────────────────────────────
 
@@ -24,7 +28,7 @@ function mapExpr(e: Expr, f: (e: Expr) => Expr | null): Expr {
   if (hit) return hit;
   const r = (x: Expr) => mapExpr(x, f);
   switch (e.kind) {
-    case "var": case "num": case "bool": case "str": case "emptyMap": case "emptySet": case "havoc": case "default": return e;
+    case "var": case "num": case "bigint": case "bool": case "str": case "emptyMap": case "emptySet": case "havoc": case "default": return e;
     case "mapLiteral": return { ...e, entries: e.entries.map(en => ({ key: r(en.key), value: r(en.value) })) };
     case "constructor": return e.args ? { ...e, args: e.args.map(r) } : e;
     case "binop": return { ...e, left: r(e.left), right: r(e.right) };
@@ -41,7 +45,7 @@ function mapExpr(e: Expr, f: (e: Expr) => Expr | null): Expr {
     case "arrayLiteral": return { ...e, elems: e.elems.map(r) };
     case "if": return { ...e, cond: r(e.cond), then: r(e.then), else: r(e.else) };
     case "match": {
-      const scr = typeof e.scrutinee === "string" ? e.scrutinee : r(e.scrutinee);
+      const scr = r(e.scrutinee);
       return { ...e, scrutinee: scr, arms: e.arms.map(a => ({ ...a, body: r(a.body) })) };
     }
     case "forall": return { ...e, body: r(e.body) };
@@ -64,7 +68,7 @@ function mapStmt(s: Stmt, f: (e: Expr) => Expr | null): Stmt {
     case "break": case "continue": return s;
     case "if": return { ...s, cond: r(s.cond), then: s.then.map(t => mapStmt(t, f)), else: s.else.map(t => mapStmt(t, f)) };
     case "match": {
-      const scr = typeof s.scrutinee === "string" ? s.scrutinee : r(s.scrutinee);
+      const scr = r(s.scrutinee);
       return { ...s, scrutinee: scr, arms: s.arms.map(a => ({ ...a, body: a.body.map(t => mapStmt(t, f)) })) };
     }
     case "while": return { ...s, cond: r(s.cond), invariants: s.invariants.map(r), body: s.body.map(t => mapStmt(t, f)) };
@@ -80,7 +84,10 @@ function mapStmt(s: Stmt, f: (e: Expr) => Expr | null): Stmt {
  *  rest of the block), `match` arm patterns, `forall`/`exists`, and `for-in`
  *  indices. Capture-avoiding: a nested scope that reintroduces `from` keeps its
  *  own binding untouched. `mapExpr` doesn't descend into lambda bodies, so this
- *  walks them by hand. */
+ *  walks them by hand — statement binders are tracked only at that body's top
+ *  level, which is enough for the sole caller (dafny-emit's
+ *  `comprehensionBinder`). TODO: generalize if more callers need this. */
+const varE = (name: string): Expr => ({ kind: "var", name });
 export function renameFreeVar(e: Expr, from: string, to: string): Expr {
   const f = (x: Expr): Expr | null => {
     if (x.kind === "var") return x.name === from ? { ...x, name: to } : x;
@@ -89,9 +96,7 @@ export function renameFreeVar(e: Expr, from: string, to: string): Expr {
     if (x.kind === "let" && x.name === from) return { ...x, value: mapExpr(x.value, f) };
     if ((x.kind === "forall" || x.kind === "exists") && x.var === from) return x;
     if (x.kind === "match") {
-      const scr = typeof x.scrutinee === "string"
-        ? (x.scrutinee === from ? to : x.scrutinee) : mapExpr(x.scrutinee, f);
-      return { ...x, scrutinee: scr, arms: x.arms.map(a =>
+      return { ...x, scrutinee: mapExpr(x.scrutinee, f), arms: x.arms.map(a =>
         patternBinds(a.pattern, from) ? a : { ...a, body: mapExpr(a.body, f) }) };
     }
     if (x.kind === "lambda") {
@@ -120,7 +125,7 @@ function mapTExpr(e: TExpr, f: (e: TExpr) => TExpr | null): TExpr {
   if (hit) return hit;
   const r = (x: TExpr) => mapTExpr(x, f);
   switch (e.kind) {
-    case "var": case "num": case "str": case "bool": case "havoc": return e;
+    case "var": case "num": case "bigint": case "str": case "bool": case "havoc": return e;
     case "binop": return { ...e, left: r(e.left), right: r(e.right) };
     case "unop": return { ...e, expr: r(e.expr) };
     case "call": return { ...e, fn: r(e.fn), args: e.args.map(r) };
@@ -197,8 +202,35 @@ let _typeDecls: TypeDeclInfo[] = [];
  *  redirected to the pure mirror. Set once per module transform. */
 let _pureDefNames: Set<string> = new Set();
 
-/** Array methods that take a function argument. */
-const HOF_METHODS = new Set(["map", "filter", "every", "some", "find", "findLast", "findIndex", "findLastIndex", "reduce"]);
+/** Discriminated unions whose tag is read as a *value* (`x.kind` compared
+ *  to another union's tag, passed as an argument, …). Each gets a generated
+ *  `<Union>_<disc>` discriminator function beside its datatype, returning
+ *  the source tag strings. Narrowing consumes discriminant *checks*, so this
+ *  fires only for surviving reads. Populated during body transforms; drained
+ *  into the types file. */
+let _neededKindHelpers = new Map<string, TypeDeclInfo>();
+
+function kindHelperName(decl: TypeDeclInfo): string {
+  return freshName(`${decl.name}_${decl.discriminant}`);
+}
+
+function kindHelperDecl(decl: TypeDeclInfo): Decl {
+  return {
+    kind: "def",
+    name: kindHelperName(decl),
+    typeParams: [],
+    params: [{ name: "t", type: { kind: "user", name: decl.name } }],
+    returnType: { kind: "string" },
+    requires: [], ensures: [], decreases: null,
+    body: {
+      kind: "match", scrutinee: varE("t"),
+      arms: decl.variants!.map(v => ({
+        pattern: { kind: "ctor" as const, ctor: v.name, binders: v.fields.map((_, i) => `_${i}`) },
+        body: { kind: "str" as const, value: v.name },
+      })),
+    },
+  };
+}
 
 /** Prefix match-bound field names to avoid capturing user variables.
  *  When prefix is given (the scrutinee name), include it to avoid
@@ -221,17 +253,16 @@ function isIntegral(ty: Ty): boolean { return ty.kind === "int" || ty.kind === "
 function isArray(ty: Ty): boolean { return ty.kind === "array"; }
 function isUser(ty: Ty): boolean { return ty.kind === "user"; }
 function isRecordType(ty: Ty): boolean {
-  if (ty.kind !== "user") return false;
-  const base = ty.name.includes("<") ? ty.name.slice(0, ty.name.indexOf("<")) : ty.name;
-  return _typeDecls.find(d => d.name === base)?.kind === "record";
+  return declOfTy(_typeDecls, ty)?.kind === "record";
 }
 
 /** Truthiness test for a *lowered* value of source type `ty`, used by `||`
- *  falsiness lowering. Mirrors narrow.ts's `canBeFalsy`: only int/nat/string/bool
- *  values can be falsy in JS (`0`, `""`, `false`); every other value (array, user
- *  type, …) is always truthy. Returns null for the always-truthy types so callers
- *  can unwrap directly instead of emitting a redundant guard. */
+ *  falsiness lowering. Which types need one is `isFalsyCapableTy` (shared with
+ *  condition-facts' falsy gate); this adds the per-type test. Returns null for
+ *  the always-truthy types so callers can unwrap directly instead of emitting
+ *  a redundant guard. */
 function valueTruthyCond(value: Expr, ty: Ty): Expr | null {
+  if (!isFalsyCapableTy(ty)) return null;
   switch (ty.kind) {
     case "int": case "nat":
       return { kind: "binop", op: "≠", left: value, right: { kind: "num", value: 0 } };
@@ -356,7 +387,7 @@ function wrapOptionalBranch(expr: Expr, raw: TExpr): Expr {
   // The dotted form `.some`/`.none` would be ambiguous in expression positions
   // like the scrutinee of an outer match. Dafny treats `Option.Some` and bare
   // `Some` equivalently — the qualification is harmless there.
-  if (raw.kind === "var" && raw.name === "undefined") return { kind: "constructor", name: "none", type: "Option" };
+  if (raw.kind === "var" && raw.name === "undefined") return { kind: "constructor", name: "none", type: "Option", args: [] };
   if (raw.ty.kind === "optional") return expr;  // already Option<T>, don't double-wrap
   return { kind: "constructor", name: "some", type: "Option", args: [expr] };
 }
@@ -415,13 +446,17 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
   switch (e.kind) {
     case "var": return { kind: "var", name: e.name };
     case "num": return { kind: "num", value: e.value };
+    case "bigint": return { kind: "bigint", value: e.value };
     case "bool": return { kind: "bool", value: e.value };
 
     case "str":
-      if (e.ty.kind === "user") return { kind: "constructor", name: e.value, type: e.ty.name };
+      if (e.ty.kind === "user") return { kind: "constructor", name: e.value, type: e.ty.name, args: [] };
       return { kind: "str", value: e.value };
 
     case "unop":
+      // Only `num` folds. A `bigint` payload is a string, so negating it here
+      // would coerce through `Number` and round: `-9007199254740993n` stays a
+      // structural `unop("-", bigint(...))` and is negated by the emitter.
       if (e.op === "-" && e.expr.kind === "num")
         return { kind: "num", value: -e.expr.value };
       // String truthiness: !str → str == ""
@@ -467,7 +502,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
           kind: "binop",
           op: e.op === "===" ? "=" : "≠",
           left: transformExpr(e.left.obj),
-          right: { kind: "constructor", name: e.right.value, type: objTy },
+          right: { kind: "constructor", name: e.right.value, type: objTy, args: [] },
         };
       }
       // String literal comparison — constructor if user type, string literal if string.
@@ -477,7 +512,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
         const left = lowerExpr(e.left, binds);
         const leftTy = e.left.ty.kind === "user" ? e.left.ty.name : undefined;
         const right: Expr = isUser(e.left.ty)
-          ? { kind: "constructor", name: e.right.value, type: leftTy }
+          ? { kind: "constructor", name: e.right.value, type: leftTy, args: [] }
           : { kind: "str", value: e.right.value };
         return { kind: "binop", op: e.op === "===" ? "=" : "≠", left, right };
       }
@@ -502,7 +537,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
         // non-optional string-literal rule above.
         const innerTy = optSide.ty.kind === "optional" ? optSide.ty.inner : optSide.ty;
         const valExpr: Expr = valSide.kind === "str" && innerTy.kind === "user"
-          ? { kind: "constructor", name: valSide.value, type: innerTy.name }
+          ? { kind: "constructor", name: valSide.value, type: innerTy.name, args: [] }
           : lowerExpr(valSide, binds);
         const cmpOp = BOOL_OP_MAP[e.op] ?? e.op;
         const noneVal = e.op === "!==" ? true : false;
@@ -539,7 +574,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       // || on optional → match Some/None with default. JS `||` tests falsiness of
       // the *unwrapped* value, so when the inner type can be falsy the Some arm must
       // re-test (`Some(0) || 1 === 1`); array/user inners are always truthy and
-      // unwrap directly. Mirrors narrow.ts's canBeFalsy gate.
+      // unwrap directly. Same gate as condition-facts' `canBeFalsy`.
       if (e.op === "||" && e.left.ty.kind === "optional") {
         const optExpr = lowerExpr(e.left, binds);
         const defaultExpr = lowerExpr(e.right, binds);
@@ -687,10 +722,18 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       // as bare truthiness checks. Emit as the Dafny discriminator predicate for the
       // 'true' variant: result.ok → result.true_?
       if (e.isDiscriminant && e.obj.ty.kind === "user") {
-        const baseName = e.obj.ty.name.includes("<") ? e.obj.ty.name.slice(0, e.obj.ty.name.indexOf("<")) : e.obj.ty.name;
-        const decl = _typeDecls.find(d => d.name === baseName && d.kind === "discriminated-union");
+        const decl = unionDeclOfTy(_typeDecls, e.obj.ty);
         if (decl?.variants?.some(v => v.name === "true")) {
           return { kind: "field", obj: transformExpr(e.obj), field: "true_?" };
+        }
+        // Surviving string-discriminant read (`x.kind` used as a value —
+        // compared against another union's tag, passed as an argument, …):
+        // lower to the generated per-union discriminator function, which
+        // returns the source tag strings. Narrowing consumes discriminant
+        // *checks*; this catches reads that survive as values.
+        if (decl?.variants && decl.discriminant && decl.discriminant !== "__isArray__") {
+          _neededKindHelpers.set(decl.name, decl);
+          return { kind: "app", fn: kindHelperName(decl), args: [lowerExpr(e.obj, binds)] };
         }
       }
       // Union destructor: `x.field` where x is a discriminated union and `field`
@@ -698,10 +741,22 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       // directly; Lean has no field projection on a multi-ctor inductive, so tag
       // the node with the union's base name and let the Lean emitter `match`.
       if (e.obj.ty.kind === "user") {
-        const baseName = e.obj.ty.name.includes("<") ? e.obj.ty.name.slice(0, e.obj.ty.name.indexOf("<")) : e.obj.ty.name;
-        const decl = _typeDecls.find(d => d.name === baseName && d.kind === "discriminated-union");
-        if (decl?.variants?.some(v => v.fields.some(f => f.name === e.field))) {
-          return { kind: "field", obj: transformExpr(e.obj), field: e.field, fromUnion: baseName, datatypeField: true };
+        const baseName = tyBaseName(e.obj.ty.name);
+        const decl = declOfKind(_typeDecls, baseName, "discriminated-union");
+        const owners = decl?.variants?.filter(v => v.fields.some(f => f.name === e.field)) ?? [];
+        if (owners.length > 0) {
+          // Shared field name with differing declared types: those destructors
+          // are renamed per-constructor, and the read's own resolved type
+          // identifies the owning variant (the types differ exactly when the
+          // rename happens). Pin it so emitters use the renamed destructor.
+          const ownerTy = (v: VariantInfo) => v.fields.find(f => f.name === e.field)?.type;
+          const differ = owners.some(v => {
+            const a = ownerTy(v), b = ownerTy(owners[0]);
+            return a && b && !tyEqual(a, b);
+          });
+          const matching = differ ? owners.filter(v => { const t = ownerTy(v); return t && tyEqual(t, e.ty); }) : [];
+          const ctor = e.ofVariant ?? (matching.length === 1 ? matching[0].name : undefined);
+          return { kind: "field", obj: transformExpr(e.obj), field: e.field, fromUnion: baseName, ctor, datatypeField: true };
         }
       }
       return { kind: "field", obj: transformExpr(e.obj), field: e.field, datatypeField: isRecordType(e.obj.ty) };
@@ -732,13 +787,12 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
           e.fn.field === "isArray" && e.args.length === 1) {
         const arg = e.args[0];
         if (arg.ty.kind === "user") {
-          const baseName = arg.ty.name.includes("<") ? arg.ty.name.slice(0, arg.ty.name.indexOf("<")) : arg.ty.name;
-          const decl = _typeDecls.find(d => d.name === baseName);
+          const decl = declOfTy(_typeDecls, arg.ty);
           if (decl?.kind === "discriminated-union" && decl.discriminant === "__isArray__") {
             return {
               kind: "binop", op: "=",
               left: lowerExpr(arg, binds),
-              right: { kind: "constructor", name: "ArrayBranch", type: arg.ty.name },
+              right: { kind: "constructor", name: "ArrayBranch", type: arg.ty.name, args: [] },
             };
           }
         }
@@ -782,7 +836,10 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       if (e.fn.kind === "field") {
         const recv = lowerExpr(e.fn.obj, binds);
         let method = e.fn.field;
-        const isHOF = e.fn.obj.ty.kind === "array" && HOF_METHODS.has(method);
+        const spec = e.builtinId !== undefined ? builtinSpec(e.builtinId) : null;
+        // Lambda-taking array builtins (registry `hof`, comparator excluded —
+        // mirrors the historical HOF_METHODS set).
+        const isHOF = spec?.hof !== undefined && spec.hof.shape !== "comparator";
         const args = e.args.map((a, i) => {
           const lowered = lowerExpr(a, binds);
           // Lean: a pure fn passed to a HOF by name resolves to the monadic
@@ -791,9 +848,9 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
               lowered.kind === "var" && _pureDefNames.has(lowered.name)) {
             return { kind: "var" as const, name: `Pure.${lowered.name}` };
           }
-          // Array index args must be nat in Lean: `with`'s index (0), includes/indexOf `from` (1).
-          const isArrIdxArg = e.fn.kind === "field" && e.fn.obj.ty.kind === "array" &&
-            ((e.fn.field === "with" && i === 0) || ((e.fn.field === "includes" || e.fn.field === "indexOf") && i === 1));
+          // Array index args must be nat in Lean: `with`'s index (0), includes/indexOf `from` (1)
+          // — registry `intArgPositions`.
+          const isArrIdxArg = spec?.intArgPositions !== undefined && spec.intArgPositions.includes(i);
           if (isArrIdxArg && !isNat(a.ty)) return { kind: "toNat" as const, expr: lowered };
           return lowered;
         });
@@ -841,8 +898,8 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       if (e.ty.kind === "user" && !e.spread) {
         const tyName = e.ty.name;
         // Match base type name (strip generic args: "Result<Model, Err>" → "Result")
-        const baseName = tyName.includes("<") ? tyName.slice(0, tyName.indexOf("<")) : tyName;
-        const decl = _typeDecls.find(d => d.name === baseName && (d.kind === "discriminated-union" || d.kind === "string-union"));
+        const baseName = tyBaseName(tyName);
+        const decl = declOfKind(_typeDecls, baseName, "discriminated-union", "string-union");
         if (decl && decl.discriminant) {
           const discField = e.fields.find(f => f.name === decl.discriminant);
           if (discField && (discField.value.kind === "str" || discField.value.kind === "bool")) {
@@ -850,8 +907,11 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
             const variant = decl.variants?.find(v => v.name === variantName);
             if (variant) {
               const nonDiscFields = e.fields.filter(f => f.name !== decl.discriminant);
-              if (nonDiscFields.length === 0) {
-                return { kind: "constructor", name: variantName, type: tyName };
+              // Bare-constructor shortcut only when the variant truly has no
+              // fields — a variant with only optional fields still needs its
+              // None-filled argument list (`int_(None)`, not `int_`).
+              if (variant.fields.length === 0) {
+                return { kind: "constructor", name: variantName, type: tyName, args: [] };
               }
               // Constructor with args: match variant field order. Emit a bare `app`
               // (Dafny renders `variantName(args)`, a valid unqualified constructor
@@ -872,9 +932,9 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       if (e.spread) {
         const spreadTy = e.spread.ty.kind === "optional" ? e.spread.ty.inner : e.spread.ty;
         const structName = spreadTy.kind === "user" ? spreadTy.name : undefined;
-        const structDecl = structName ? _typeDecls.find(d => d.name === structName && d.kind === "record") : undefined;
+        const structDecl = structName ? declOfKind(_typeDecls, structName, "record") : undefined;
         // Also check discriminated-union variants for field types
-        const unionDecl = structName ? _typeDecls.find(d => d.name === structName && d.kind === "discriminated-union") : undefined;
+        const unionDecl = structName ? declOfKind(_typeDecls, structName, "discriminated-union") : undefined;
         const loweredFields = e.fields.map(f => {
           // Propagate declared field type onto value if it has unknown type
           let fieldValue = f.value;
@@ -923,10 +983,8 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       // Carry the resolved record type so the emitter can pick the right
       // constructor when two datatypes share a field-name set (Event vs
       // SparseEvent) — structural matching alone would take the first-declared.
-      const recName = e.ty.kind === "user"
-        ? (e.ty.name.includes("<") ? e.ty.name.slice(0, e.ty.name.indexOf("<")) : e.ty.name)
-        : undefined;
-      const ctor = recName && _typeDecls.find(d => d.name === recName && d.kind === "record") ? recName : undefined;
+      const recName = e.ty.kind === "user" ? tyBaseName(e.ty.name) : undefined;
+      const ctor = recName && declOfKind(_typeDecls, recName, "record") ? recName : undefined;
       return { kind: "record", spread: null, ctor, fields: e.fields.map(f => ({ name: f.name, value: lowerExpr(f.value, binds) })) };
     }
 
@@ -978,11 +1036,11 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
 
     case "optChain":
       // Narrow should have rewritten optChain to someMatch.
-      throw new Error(`optChain reached transform — narrow should have rewritten it`);
+      throw new Error(`optChain reached transform — narrow should have rewritten it: ${JSON.stringify(e).slice(0, 400)}`);
 
     case "nullish":
       // Narrow should have rewritten nullish to someMatch.
-      throw new Error(`nullish reached transform — narrow should have rewritten it`);
+      throw new Error(`nullish reached transform — narrow should have rewritten it: ${JSON.stringify(e).slice(0, 300)}`);
 
     case "havoc":
       // Dafny's * only works in var/assign positions — lift to own declaration
@@ -1005,7 +1063,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
         // Bare-var shortcut, but route \result through lowerExpr so the
         // lemma-side replaceVar pass can substitute it with the function call.
         scrutinee = path.fields.length === 0 && path.rootVar !== "\\result"
-          ? path.rootVar
+          ? varE(path.rootVar)
           : lowerExpr(e.scrutinee, binds);
       } else {
         // Complex scrutinee — narrow pre-bound the someBody to use the binder directly,
@@ -1036,7 +1094,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       // Path scrutinees (e.g. `m.content`) get a synthesized hint derived
       // from the last field/var name so the binder reads naturally.
       const scrutinee = lowerExpr(e.scrutinee, binds);
-      const decl = _typeDecls.find(d => d.name === e.typeName);
+      const decl = declOf(_typeDecls, e.typeName);
       const isSynthArrayUnion = decl?.discriminant === "__isArray__";
       const varName = e.scrutinee.kind === "var" ? e.scrutinee.name : undefined;
       const pathHint = varName ?? scrutineeHint(e.scrutinee);
@@ -1046,7 +1104,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
         const fields = variant?.fields ?? [];
         let body = lowerExpr(c.body, binds);
         if (varName && fields.length > 0) {
-          body = replaceFieldAccess(body, varName, fields);
+          body = replaceFieldAccess(body, varName, fields, c.variant, tyBaseName(e.typeName));
           if (isSynthArrayUnion && fields.length === 1) {
             body = replaceVarInExpr(body, varName, matchBinder(fields[0].name, varName));
           }
@@ -1064,7 +1122,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
         if (wrapOpt) body = wrapOptionalBranch(body, e.fallthrough);
         arms.push({ pattern: pWild(), body });
       }
-      return { kind: "match", scrutinee: varName ?? scrutinee, arms };
+      return { kind: "match", scrutinee: varName !== undefined ? varE(varName) : scrutinee, arms };
     }
   }
 }
@@ -1093,7 +1151,7 @@ function ensuresToMatch(e: TExpr, typeDecls: TypeDeclInfo[]): Expr | null {
   const obj = e.left.left.obj;
   if (obj.kind !== "var" || obj.ty.kind !== "user") return null;
   const typeName = obj.ty.name;
-  const decl = typeDecls.find(d => d.name === typeName && d.kind === "discriminated-union");
+  const decl = declOfKind(typeDecls, typeName, "discriminated-union");
   if (!decl) return null;
 
   const variantName = e.left.right.value;
@@ -1106,17 +1164,25 @@ function ensuresToMatch(e: TExpr, typeDecls: TypeDeclInfo[]): Expr | null {
   let rhs = transformExpr(e.right);
   rhs = replaceFieldAccess(rhs, obj.name, fields);
 
-  return { kind: "match", scrutinee: obj.name, arms: [{ pattern, body: rhs }, { pattern: pWild(), body: { kind: "bool", value: true } }] };
+  return { kind: "match", scrutinee: varE(obj.name), arms: [{ pattern, body: rhs }, { pattern: pWild(), body: { kind: "bool", value: true } }] };
 }
 
-function replaceFieldAccess(e: Expr, varName: string, fields: { name: string; tsType: string }[]): Expr {
+function replaceFieldAccess(e: Expr, varName: string, fields: { name: string; tsType: string }[], ctorName?: string, ctorOf?: string): Expr {
   return mapExpr(e, x => {
     if (x.kind === "field" && x.obj.kind === "var" && x.obj.name === varName) {
       const f = fields.find(f => f.name === x.field);
       if (f) return { kind: "var", name: matchBinder(f.name, varName) };
     }
+    // Datatype update of the scrutinee (`{ ...vn, f: v }`): the arm knows the
+    // variant, so stamp it — emitters need it for per-constructor destructor
+    // names. Recurse manually (returning a node stops mapExpr's own descent).
+    if (ctorName && x.kind === "record" && !x.ctor && x.spread &&
+        x.spread.kind === "var" && x.spread.name === varName) {
+      return { ...x, ctor: ctorName, ctorOf,
+        fields: x.fields.map(f => ({ ...f, value: replaceFieldAccess(f.value, varName, fields, ctorName, ctorOf) })) };
+    }
     // If this let shadows the matched variable, stop replacing in the body
-    if (x.kind === "let" && x.name === varName) return { ...x, value: replaceFieldAccess(x.value, varName, fields) };
+    if (x.kind === "let" && x.name === varName) return { ...x, value: replaceFieldAccess(x.value, varName, fields, ctorName, ctorOf) };
     return null;
   });
 }
@@ -1168,10 +1234,11 @@ function scrutineeHint(e: TExpr): string {
 // `if (X) continue; rest` → `if (!X) { rest }` at the top of a loop body.
 // Dafny's lowered while-loops have the index increment at the bottom, so a
 // `continue` would skip it and loop forever; rewriting to if/else lets the
-// loop fall through normally.
+// loop fall through normally. The operand is already-lowered IR, where
+// negation is spelled `¬` (lowerExpr rewrites `!`).
 function negateExpr(e: Expr): Expr {
-  if (e.kind === "unop" && e.op === "!") return e.expr;
-  return { kind: "unop", op: "!", expr: e };
+  if (e.kind === "unop" && e.op === "¬") return e.expr;
+  return { kind: "unop", op: "¬", expr: e };
 }
 
 /** Build the two pieces of an `arr.pop()` lowering on a named array variable:
@@ -1284,13 +1351,10 @@ function matchToIfChains(stmts: Stmt[]): Stmt[] {
     const arms = s.arms.map(a => ({ ...a, body: matchToIfChains(a.body) }));
     const ctorArms = arms.filter(a => a.pattern.kind !== "wild");
     const firstCtor = ctorArms[0] ? patternCtor(ctorArms[0].pattern) : undefined;
-    const decl = firstCtor
-      ? _typeDecls.find(d => (d.kind === "discriminated-union" || d.kind === "string-union") &&
-          ((d.variants?.some(v => v.name === firstCtor)) || (d.values?.includes(firstCtor))))
-      : undefined;
+    const decl = firstCtor ? declWithVariant(_typeDecls, firstCtor) : undefined;
     if (!decl) return [{ ...s, arms }]; // not a user union (e.g. Option) — leave as match
 
-    const scrutExpr: Expr = typeof s.scrutinee === "string" ? { kind: "var", name: s.scrutinee } : s.scrutinee;
+    const scrutExpr: Expr = s.scrutinee;
     const defaultArm = arms.find(a => a.pattern.kind === "wild");
     let elseBranch: Stmt[] = defaultArm ? defaultArm.body : [];
     for (let k = ctorArms.length - 1; k >= 0; k--) {
@@ -1307,7 +1371,7 @@ function matchToIfChains(stmts: Stmt[]): Stmt[] {
         ? { kind: "match", scrutinee: scrutExpr, arms: [
             { pattern: pCtor(ctor), body: { kind: "bool", value: true } },
             { pattern: pWild(), body: { kind: "bool", value: false } }] }
-        : { kind: "binop", op: "=", left: scrutExpr, right: { kind: "constructor", name: ctor, type: decl.name } };
+        : { kind: "binop", op: "=", left: scrutExpr, right: { kind: "constructor", name: ctor, type: decl.name, args: [] } };
       // Bind only the constructor-field binders the body actually uses, pinning the
       // owning ctor so the destructor doesn't guess (variants share field names).
       const lets: Stmt[] = [];
@@ -1356,6 +1420,26 @@ function requireDoneWithForBreaks(stmts: Stmt[], fnName: string): void {
       requireDoneWithForBreaks(s.body, fnName);
     }
   }
+}
+
+/** The forin emission places the index increment at the loop-body end, so a
+ *  surviving `continue` would skip it. Insert the increment immediately
+ *  before every same-scope continue (nested loops own their continues),
+ *  mirroring the C-style-for desugar's discipline. */
+function insertIncrementBeforeContinue(stmts: Stmt[], idxName: string): Stmt[] {
+  const incr: Stmt = { kind: "assign", target: idxName,
+    value: { kind: "binop", op: "+", left: { kind: "var", name: idxName }, right: { kind: "num", value: 1 } } };
+  const walk = (ss: Stmt[]): Stmt[] => {
+    const out: Stmt[] = [];
+    for (const s of ss) {
+      if (s.kind === "continue") { out.push(incr, s); continue; }
+      if (s.kind === "if") { out.push({ ...s, then: walk(s.then), else: walk(s.else) }); continue; }
+      if (s.kind === "match") { out.push({ ...s, arms: s.arms.map(a => ({ ...a, body: walk(a.body) })) }); continue; }
+      out.push(s);
+    }
+    return out;
+  };
+  return walk(stmts);
 }
 
 function eliminateTopLevelContinue(stmts: Stmt[]): Stmt[] {
@@ -1466,7 +1550,8 @@ function transformStmts(stmts: TStmt[], typeDecls: TypeDeclInfo[]): Stmt[] {
       const arrSize: Expr = { kind: "field", obj: seq, field: "size" };
       // Auto-add bound invariant: idx ≤ bound (always true for range loops)
       const boundInv: Expr = { kind: "binop", op: "≤", left: idxVar, right: arrSize };
-      const bodyStmts = eliminateTopLevelContinue(transformStmts(s.body, typeDecls));
+      const bodyStmts = insertIncrementBeforeContinue(
+        eliminateTopLevelContinue(transformStmts(s.body, typeDecls)), idxName);
       result.push({
         kind: "forin", idx: idxName, bound: arrSize,
         invariants: [boundInv, ...s.invariants.map(transformExpr)],
@@ -1684,7 +1769,7 @@ function transformStmt(s: TStmt, typeDecls: TypeDeclInfo[]): Stmt[] {
         const replaced = replacePathInTStmts(s.someBody, path, s.binder, s.binderTy);
         const someBody = transformStmts(replaced, typeDecls);
         const noneBody = transformStmts(s.noneBody, typeDecls);
-        const scrutinee: Expr | string = path.fields.length === 0 ? path.rootVar : transformExpr(s.scrutinee);
+        const scrutinee: Expr = path.fields.length === 0 ? varE(path.rootVar) : transformExpr(s.scrutinee);
         return [{
           kind: "match", scrutinee,
           arms: [
@@ -1722,15 +1807,15 @@ function mapStmtExprs(s: Stmt, r: (e: Expr) => Expr): Stmt {
 function buildMatchArms<T>(
   cases: { name: string; body: TStmt[] }[],
   varName: string | undefined, typeName: string | undefined, typeDecls: TypeDeclInfo[],
-  transformBody: (body: TStmt[], varName: string | undefined, fields: { name: string; tsType: string }[]) => T | null
+  transformBody: (body: TStmt[], varName: string | undefined, fields: { name: string; tsType: string }[], ctorName?: string) => T | null
 ): { pattern: MatchPattern; body: T }[] | null {
-  const decl = typeName ? typeDecls.find(d => d.name === typeName) : undefined;
+  const decl = typeName ? declOf(typeDecls, typeName) : undefined;
   const arms: { pattern: MatchPattern; body: T }[] = [];
   for (const c of cases) {
     const variant = decl?.variants?.find(v => v.name === c.name);
     const fields = variant?.fields ?? [];
     const pattern = buildMatchPattern(c.name, fields, varName);
-    const body = transformBody(c.body, varName, fields);
+    const body = transformBody(c.body, varName, fields, c.name);
     if (body === null) return null;
     arms.push({ pattern, body });
   }
@@ -1744,7 +1829,7 @@ function emitMatchStmt(
   fallthrough: TStmt[],
   typeDecls: TypeDeclInfo[],
 ): Stmt {
-  const decl = typeDecls.find(d => d.name === typeName);
+  const decl = declOf(typeDecls, typeName);
   // Synth array-unions (discriminant "__isArray__") have single-field variants
   // ArrayBranch(arr) / NonArrayBranch(val). The matched arm refers to the
   // scrutinee by its bare name/path (`content`, `m.content`), not `.arr`, so
@@ -1797,7 +1882,7 @@ function emitMatchStmt(
       arms.push({ pattern: pWild(), body: transformStmts(fallthrough, typeDecls) });
     }
   }
-  return { kind: "match", scrutinee: isPath ? transformExpr(scrutinee) : prefix, arms };
+  return { kind: "match", scrutinee: isPath ? transformExpr(scrutinee) : varE(prefix), arms };
 }
 
 /** Replace bare `var(oldName)` references → `var(newName)` with the given type.
@@ -1814,7 +1899,7 @@ function replaceVarInTStmts(stmts: TStmt[], oldName: string, newName: string, ne
 
 /** If the chain has matched all variants but one, return that remaining variant. */
 function remainingVariant(typeName: string, cases: { variant: string }[], typeDecls: TypeDeclInfo[]): { name: string; fields: { name: string; tsType: string; type?: Ty }[] } | null {
-  const decl = typeDecls.find(d => d.name === typeName);
+  const decl = declOf(typeDecls, typeName);
   if (!decl?.variants) return null;
   const matched = new Set(cases.map(c => c.variant));
   const remaining = decl.variants.filter(v => !matched.has(v.name));
@@ -1831,10 +1916,7 @@ function remainingVariant(typeName: string, cases: { variant: string }[], typeDe
  *  their usual way. Shared by emitSwitchStmt and transformPureSwitch. */
 function enumFieldSwitch(s: TStmt & { kind: "switch" }, typeDecls: TypeDeclInfo[]): { scrutinee: Expr; enumTyName: string | undefined } | null {
   if (!s.discriminant) return null;
-  const objBase = s.expr.ty.kind === "user"
-    ? (s.expr.ty.name.includes("<") ? s.expr.ty.name.slice(0, s.expr.ty.name.indexOf("<")) : s.expr.ty.name)
-    : undefined;
-  const objDecl = objBase ? typeDecls.find(d => d.name === objBase) : undefined;
+  const objDecl = declOfTy(typeDecls, s.expr.ty);
   if (objDecl?.kind === "discriminated-union" && objDecl.discriminant === s.discriminant) return null;
   const fieldTy = objDecl?.kind === "record" ? objDecl.fields?.find(f => f.name === s.discriminant)?.type : undefined;
   return {
@@ -1843,15 +1925,36 @@ function enumFieldSwitch(s: TStmt & { kind: "switch" }, typeDecls: TypeDeclInfo[
   };
 }
 
+/** Stamp variant ctor info onto datatype updates of the match scrutinee in
+ *  lowered arm bodies (`{ ...vn, f: v }`) — the statement-path twin of
+ *  `replaceFieldAccess`'s stamping. Emitters need the pin to use
+ *  per-constructor destructor names for collision-renamed fields. */
+function stampScrutineeUpdates(body: Stmt[], varName: string, ctorName: string, ctorOf: string): Stmt[] {
+  const stamp = (x: Expr): Expr | null => {
+    if (x.kind === "record" && !x.ctor && x.spread &&
+        x.spread.kind === "var" && x.spread.name === varName) {
+      return { ...x, ctor: ctorName, ctorOf,
+        fields: x.fields.map(f => ({ ...f, value: mapExpr(f.value, stamp) })) };
+    }
+    return null;
+  };
+  return body.map(st => mapStmt(st, stamp));
+}
+
 function emitSwitchStmt(s: TStmt & { kind: "switch" }, typeDecls: TypeDeclInfo[]): Stmt {
   const cases = s.cases.map(c => ({ name: c.label, body: c.body }));
   const ef = enumFieldSwitch(s, typeDecls);
+  const baseName = s.expr.ty.kind === "user" ? tyBaseName(s.expr.ty.name) : undefined;
   const arms = ef
     ? buildMatchArms(cases, undefined, ef.enumTyName, typeDecls, (body) => transformStmts(body, typeDecls))!
     : buildMatchArms(cases, s.expr.kind === "var" ? s.expr.name : "?", s.expr.ty.kind === "user" ? s.expr.ty.name : undefined, typeDecls,
-        (body, vn, fields) => transformStmts(replaceFieldAccessInTStmts(body, vn!, fields), typeDecls))!;
+        (body, vn, fields, ctorName) => {
+          let out = transformStmts(replaceFieldAccessInTStmts(body, vn!, fields), typeDecls);
+          if (ctorName && vn && baseName) out = stampScrutineeUpdates(out, vn, ctorName, baseName);
+          return out;
+        })!;
   if (s.defaultBody.length > 0) arms.push({ pattern: pWild(), body: transformStmts(s.defaultBody, typeDecls) });
-  return { kind: "match", scrutinee: ef ? ef.scrutinee : (s.expr.kind === "var" ? s.expr.name : "?"), arms };
+  return { kind: "match", scrutinee: ef ? ef.scrutinee : varE(s.expr.kind === "var" ? s.expr.name : "?"), arms };
 }
 
 /** Replace obj.field → replacement var in typed IR.
@@ -1991,7 +2094,7 @@ function transformPureBody(stmts: TStmt[], typeDecls: TypeDeclInfo[]): Expr | nu
           if (!someExpr) return null;
           const noneExpr = transformPureBody([...s.noneBody, ...rest], typeDecls);
           if (!noneExpr) return null;
-          const scrutinee: Expr | string = path.fields.length === 0 ? path.rootVar : transformExpr(s.scrutinee);
+          const scrutinee: Expr = path.fields.length === 0 ? varE(path.rootVar) : transformExpr(s.scrutinee);
           return {
             kind: "match", scrutinee,
             arms: [
@@ -2022,14 +2125,14 @@ function transformPureSwitch(s: TStmt & { kind: "switch" }, typeDecls: TypeDeclI
     return { kind: "match", scrutinee: ef.scrutinee, arms };
   }
   const typeName = s.expr.ty.kind === "user" ? s.expr.ty.name : "";
-  if (!typeDecls.find(d => d.name === typeName)) return null;
+  if (!declOf(typeDecls, typeName)) return null;
   const varName = s.expr.kind === "var" ? s.expr.name : undefined;
   const cases = s.cases.map(c => ({ name: c.label, body: c.body }));
   const arms = buildMatchArms(cases, varName, typeName, typeDecls,
-    (body, vn, fields) => {
+    (body, vn, fields, ctorName) => {
       let result = transformPureBody(body, typeDecls);
       if (!result) return null;
-      if (fields.length > 0 && vn) result = replaceFieldAccess(result, vn, fields);
+      if (fields.length > 0 && vn) result = replaceFieldAccess(result, vn, fields, ctorName, tyBaseName(typeName));
       return result;
     });
   if (!arms) return null;
@@ -2039,21 +2142,21 @@ function transformPureSwitch(s: TStmt & { kind: "switch" }, typeDecls: TypeDeclI
     arms.push({ pattern: pWild(), body });
   }
   if (s.expr.kind !== "var") return null;
-  return { kind: "match", scrutinee: s.expr.name, arms };
+  return { kind: "match", scrutinee: varE(s.expr.name), arms };
 }
 
 function transformPureMatch(chain: Chain, typeDecls: TypeDeclInfo[]): Expr | null {
   const cases = chain.cases.map(c => ({ name: c.variant, body: c.body }));
-  const decl = typeDecls.find(d => d.name === chain.typeName);
+  const decl = declOf(typeDecls, chain.typeName);
   // Synth array-unions have single-field variants and user code refers to the
   // scrutinee by its bare name, not field-accessed. See emitMatchStmt for
   // the statement-level counterpart of this substitution.
   const isSynthArrayUnion = decl?.discriminant === "__isArray__";
   const arms = buildMatchArms(cases, chain.varName, chain.typeName, typeDecls,
-    (body, vn, fields) => {
+    (body, vn, fields, ctorName) => {
       let result = transformPureBody(body, typeDecls);
       if (!result) return null;
-      if (fields.length > 0 && vn) result = replaceFieldAccess(result, vn, fields);
+      if (fields.length > 0 && vn) result = replaceFieldAccess(result, vn, fields, ctorName, tyBaseName(chain.typeName));
       if (isSynthArrayUnion && fields.length === 1 && vn) {
         result = replaceVarInExpr(result, vn, matchBinder(fields[0].name, vn));
       }
@@ -2070,7 +2173,7 @@ function transformPureMatch(chain: Chain, typeDecls: TypeDeclInfo[]): Expr | nul
       // Exactly one variant left — destructure for variant-specific field access.
       let body = transformPureBody(chain.fallthrough, typeDecls);
       if (!body) return null;
-      if (remaining.fields.length > 0) body = replaceFieldAccess(body, chain.varName, remaining.fields);
+      if (remaining.fields.length > 0) body = replaceFieldAccess(body, chain.varName, remaining.fields, remaining.name, tyBaseName(chain.typeName));
       if (isSynthArrayUnion && remaining.fields.length === 1) {
         body = replaceVarInExpr(body, chain.varName, matchBinder(remaining.fields[0].name, chain.varName));
       }
@@ -2081,7 +2184,7 @@ function transformPureMatch(chain: Chain, typeDecls: TypeDeclInfo[]): Expr | nul
       arms.push({ pattern: pWild(), body });
     }
   }
-  return { kind: "match", scrutinee: chain.varName, arms };
+  return { kind: "match", scrutinee: varE(chain.varName), arms };
 }
 
 // ── Generate type declarations ───────────────────────────────
@@ -2206,6 +2309,7 @@ export function transformModule(mod: TModule, specImport?: string, moduleBaseOve
   _forofCounters.clear();
   _liftCounter = 0;
   _typeDecls = mod.typeDecls;
+  _neededKindHelpers = new Map();
   _pureDefNames = new Set(mod.functions.filter(f => f.isPure).map(f => f.name));
   const typeDecls = mod.typeDecls.map(transformTypeDecl);
 
@@ -2277,28 +2381,6 @@ export function transformModule(mod: TModule, specImport?: string, moduleBaseOve
       ensures: ext.ensures.map(e => replaceVar(transformExpr(e), "\\result", fnCall)),
     };
   });
-
-  // Types file
-  const typesImports: string[] = ["LemmaScript"];
-  let typesFile: Module | null = null;
-  const pureNamespace: Decl[] = pureDefs.length > 0
-    ? [{ kind: "namespace", name: "Pure", decls: pureDefs }]
-    : [];
-  if (typeDecls.length > 0 || pureDefs.length > 0 || externDecls.length > 0) {
-    // Declaration order differs by backend. Dafny allows forward references, so
-    // externs go first to be in scope everywhere. Lean requires definition-before-use:
-    // an extern's signature may reference a declared type (e.g. `estimateTokens(m: AgentMessage)`),
-    // so types must precede externs, which in turn precede the pure mirrors that may call them.
-    const decls = _opts.backend === "lean"
-      ? [...typeDecls, ...externDecls, ...pureNamespace]
-      : [...externDecls, ...typeDecls, ...pureNamespace];
-    typesFile = {
-      comment: "  Generated by lsc — Lean types and pure function mirrors.",
-      imports: typesImports,
-      options: [],
-      decls,
-    };
-  }
 
   // Def file: Velvet methods
   // Pure functions get a thin wrapper that calls Pure.fnName
@@ -2379,6 +2461,76 @@ export function transformModule(mod: TModule, specImport?: string, moduleBaseOve
       methods: classMethods,
     };
   });
+
+  // Types file — assembled after all body transforms, so needs discovered
+  // there (discriminator kind-helpers) are included.
+  const kindHelpers: Decl[] = [..._neededKindHelpers.values()].map(kindHelperDecl);
+
+  // ── Imported / undeclared user types: opaque by default ─────────────
+  // A module may reference types it imports (ir.ts uses typedir's `Ty`).
+  // Standalone compilation has no declaration for them; synthesize an
+  // opaque type — the value passes through, uninspectable, which is the
+  // only sound use of an undeclared type (same doctrine as _synthOpaque).
+  // Any attempted inspection still fails loudly: an opaque type has no
+  // constructors and no operations. Signature-level coverage (type-decl
+  // fields, params, returns, class fields, externs, consts); a body-level
+  // reference to an undeclared type still errors in the backend.
+  const referenced = new Set<string>();
+  const collectTy = (ty: Ty): void => {
+    switch (ty.kind) {
+      case "user": referenced.add(tyBaseName(ty.name)); return;
+      case "array": case "set": collectTy(ty.elem); return;
+      case "optional": collectTy(ty.inner); return;
+      case "map": collectTy(ty.key); collectTy(ty.value); return;
+      case "tuple": ty.elems.forEach(collectTy); return;
+      case "fn": ty.params.forEach(collectTy); collectTy(ty.result); return;
+      default: return;
+    }
+  };
+  const knownTypeNames = new Set<string>(typeDecls.map(d => (d as { name: string }).name));
+  const allTypeParams = new Set<string>();
+  // Exclude type params from the *source* decls — the transformed IR drops
+  // them for aliases (`type Step<S, A> = …`), and a generic alias's params
+  // must not be mistaken for imported types. Params may carry a `//@ type`
+  // decoration ("S(==)"); references collect as the bare name, so strip it.
+  const addTp = (tp: string): void => { allTypeParams.add(tp.replace(/\(.*$/, "").trim()); };
+  for (const d of mod.typeDecls) d.typeParams?.forEach(addTp);
+  for (const d of typeDecls) {
+    if (d.kind === "inductive") d.constructors.forEach(c => c.fields.forEach(f => collectTy(f.type)));
+    else if (d.kind === "structure") d.fields.forEach(f => collectTy(f.type));
+    else if (d.kind === "type-alias") collectTy(d.target);
+  }
+  for (const fn of mod.functions) { fn.typeParams.forEach(addTp); fn.params.forEach(p => collectTy(p.ty)); collectTy(fn.returnTy); }
+  for (const cls of mod.classes ?? []) {
+    cls.fields.forEach(f => collectTy(f.ty));
+    for (const m of cls.methods) { m.typeParams.forEach(addTp); m.params.forEach(p => collectTy(p.ty)); collectTy(m.returnTy); }
+  }
+  for (const ext of mod.externs ?? []) { ext.typeParams.forEach(addTp); ext.params.forEach(p => collectTy(p.ty)); collectTy(ext.returnTy); }
+  for (const c of mod.constants ?? []) collectTy(c.ty);
+  const opaqueImports: Decl[] = [...referenced]
+    .filter(n => !knownTypeNames.has(n) && !allTypeParams.has(n))
+    .map(n => ({ kind: "opaque-type" as const, name: n }));
+  const typesImports: string[] = ["LemmaScript"];
+  let typesFile: Module | null = null;
+  const pureNamespace: Decl[] = pureDefs.length > 0
+    ? [{ kind: "namespace", name: "Pure", decls: pureDefs }]
+    : [];
+  if (typeDecls.length > 0 || pureDefs.length > 0 || externDecls.length > 0 || opaqueImports.length > 0) {
+    // Declaration order differs by backend. Dafny allows forward references, so
+    // externs go first to be in scope everywhere. Lean requires definition-before-use:
+    // an extern's signature may reference a declared type (e.g. `estimateTokens(m: AgentMessage)`),
+    // so types must precede externs, which in turn precede the pure mirrors that may call them.
+    // Kind-helpers sit right after the datatypes they discriminate.
+    const decls = _opts.backend === "lean"
+      ? [...opaqueImports, ...typeDecls, ...kindHelpers, ...externDecls, ...pureNamespace]
+      : [...externDecls, ...opaqueImports, ...typeDecls, ...kindHelpers, ...pureNamespace];
+    typesFile = {
+      comment: "  Generated by lsc — Lean types and pure function mirrors.",
+      imports: typesImports,
+      options: [],
+      decls,
+    };
+  }
 
   const defImport = specImport ?? (typesFile ? `«${moduleBase}.types»` : null);
   const defBaseImports: string[] = defImport ? [defImport] : ["LemmaScript"];

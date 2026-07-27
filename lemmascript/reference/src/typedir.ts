@@ -5,6 +5,10 @@
  * Still TS-shaped (not Lean-shaped).
  */
 
+// Type-only: erased at runtime, so the builtins ↔ typedir reference cycle
+// never materializes.
+import type { BuiltinId } from "./builtins.js";
+
 // ── Types ────────────────────────────────────────────────────
 
 // `big` marks an int/nat that originated from a TS `bigint` (literal `123n` or
@@ -65,10 +69,14 @@ export function tyEqual(a: Ty, b: Ty): boolean {
 
 export type CallKind = "pure" | "method" | "spec-pure" | "unknown"
 
-/** Typed counterpart of RawChainStep. Carries the result-type at this step. */
+/** Typed counterpart of RawChainStep. Carries the result-type at this step.
+ *  `builtinId` is the builtin identity assigned once by resolve
+ *  (DESIGN_LS_IN_LS.md §3): present iff `(receiver type kind, method name)`
+ *  matched the registry at resolve time. Downstream passes read
+ *  classification off the stamp instead of re-recognizing by spelling. */
 export type TChainStep =
   | { kind: "field"; name: string; ty: Ty }
-  | { kind: "call"; args: TExpr[]; ty: Ty; callKind: CallKind }
+  | { kind: "call"; args: TExpr[]; ty: Ty; callKind: CallKind; builtinId?: BuiltinId }
   | { kind: "index"; idx: TExpr; ty: Ty };
 
 // ── Expressions ──────────────────────────────────────────────
@@ -76,14 +84,17 @@ export type TChainStep =
 export type TExpr =
   | { kind: "var"; name: string; ty: Ty }
   | { kind: "num"; value: number; ty: Ty }
+  | { kind: "bigint"; value: string; ty: Ty }   // exact integer, canonical decimal
   | { kind: "str"; value: string; ty: Ty }
   | { kind: "bool"; value: boolean; ty: Ty }
   | { kind: "binop"; op: string; left: TExpr; right: TExpr; ty: Ty }
   | { kind: "unop"; op: string; expr: TExpr; ty: Ty }
-  | { kind: "call"; fn: TExpr; args: TExpr[]; ty: Ty; callKind: CallKind }
+  | { kind: "call"; fn: TExpr; args: TExpr[]; ty: Ty; callKind: CallKind;
+      builtinId?: BuiltinId }
   | { kind: "index"; obj: TExpr; idx: TExpr; ty: Ty }
   | { kind: "field"; obj: TExpr; field: string; ty: Ty;
-      isDiscriminant?: boolean }            // true if this is a discriminant field access
+      isDiscriminant?: boolean;             // true if this is a discriminant field access
+      ofVariant?: string }                  // which union variant the field is read from, when narrowing determined it
   | { kind: "record"; spread: TExpr | null; fields: { name: string; value: TExpr }[]; ty: Ty }
   | { kind: "arrayLiteral"; elems: TExpr[]; ty: Ty }
   | { kind: "lambda"; params: { name: string; ty: Ty }[]; body: TStmt[]; ty: Ty }
