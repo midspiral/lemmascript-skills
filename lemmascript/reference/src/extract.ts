@@ -17,6 +17,21 @@ import { setUserNames, freshName } from "./names.js";
 /** When set, calls whose function/method name matches this key are replaced with havoc. */
 let _havocKey: string | null = null;
 
+/** A leading `//@ havoc`, `//@ havoc : Type`, or `//@ havoc <key>` directive. */
+function havocDirective(s: Node): { type: string | null; key: string | null } | null {
+  const m = s.getLeadingCommentRanges()
+    .map(r => r.getText().trim().match(/^\/\/@ havoc(?:\s*:\s*(.+)|(?:\s+(\S+)))?$/))
+    .find(m => m !== null);
+  return m ? { type: m[1]?.trim() ?? null, key: m[2] ?? null } : null;
+}
+
+/** Run `fn` with `key` as the subexpression havoc key, restoring the outer one. */
+function withHavocKey<T>(key: string | null, fn: () => T): T {
+  const saved = _havocKey;
+  if (key) _havocKey = key;
+  try { return fn(); } finally { _havocKey = saved; }
+}
+
 /** Auto-detected cross-file calls. Populated by `extractExpr` whenever it sees
  *  a call `Obj.method(...)` or `foo(...)` whose ts-morph symbol resolves to a
  *  different `.ts` source file. Emitted in Dafny as `function {:axiom} <flat>`.
@@ -328,14 +343,18 @@ function _eraseGenerics(tsType: string): string {
 }
 
 function extractExpr(node: Expression): RawExpr {
-  // Havoc key matching: replace matching calls with havoc expression
-  if (_havocKey && Node.isCallExpression(node)) {
+  // Havoc key matching: replace matching calls or new expressions with havoc expression
+  if (_havocKey && (Node.isCallExpression(node) || Node.isNewExpression(node))) {
     const fnExpr = node.getExpression();
     const name = Node.isPropertyAccessExpression(fnExpr) ? fnExpr.getName()
       : Node.isIdentifier(fnExpr) ? fnExpr.getText()
       : null;
     if (name === _havocKey) {
-      return { kind: "havoc", tsType: typeToString(node.getType()) };
+      // Prefer the contextual type: the abstracted value stands in where the
+      // surrounding code expects it, and a subclass (`new SdkError` into an
+      // `Error` field) has no subtyping relation once both are opaque.
+      const ty = node.getContextualType() ?? node.getType();
+      return { kind: "havoc", tsType: typeToString(ty) };
     }
   }
 
@@ -1241,12 +1260,10 @@ function extractStmts(stmts: Node[]): RawStmt[] {
     }
 
     if (Node.isVariableStatement(s)) {
-      const havocMatch = s.getLeadingCommentRanges()
-        .map(r => r.getText().trim().match(/^\/\/@ havoc(?:\s*:\s*(.+)|(?:\s+(\S+)))?$/))
-        .find(m => m !== null);
-      const havocType = havocMatch?.[1]?.trim() ?? null;  // //@ havoc : Type
-      const havocKey = havocMatch?.[2] ?? null;            // //@ havoc key
-      const isHavoc = !!havocMatch;
+      const havoc = havocDirective(s);
+      const havocType = havoc?.type ?? null;   // //@ havoc : Type
+      const havocKey = havoc?.key ?? null;     // //@ havoc key
+      const isHavoc = !!havoc;
       for (const d of s.getDeclarations()) {
         // Havoc on destructuring: emit each named binding as a separate havoced variable
         const nameNode = d.getNameNode();
@@ -1677,7 +1694,12 @@ function extractStmts(stmts: Node[]): RawStmt[] {
       // functions this would emit the wrong shape, but lsc has no current
       // examples of explicit bare return in void functions; revisit if one
       // appears.
-      result.push({ kind: "return", value: expr ? extractExpr(expr) : { kind: "var", name: "undefined" }, line });
+      // `//@ havoc <key>` on a return abstracts the matching calls or new
+      // expressions inside the returned expression — there is no variable to
+      // hang a whole-value havoc on, so only the key form applies here.
+      const value = withHavocKey(havocDirective(s)?.key ?? null, () =>
+        expr ? extractExpr(expr) : { kind: "var" as const, name: "undefined" });
+      result.push({ kind: "return", value, line });
       continue;
     }
 
@@ -1696,14 +1718,12 @@ function extractStmts(stmts: Node[]): RawStmt[] {
       // //@ havoc before `x = e` — discard the RHS, assign a nondeterministic
       // value of x's type. Only applies to plain `=` with an identifier LHS;
       // compound assigns, `arr[i] = v`, and `x++` fall through to desugaring.
-      const havocMatch = s.getLeadingCommentRanges()
-        .map(r => r.getText().trim().match(/^\/\/@ havoc(?:\s*:\s*(.+))?$/))
-        .find(m => m !== null);
-      if (havocMatch && Node.isBinaryExpression(expr)
+      const havoc = havocDirective(s);
+      if (havoc && !havoc.key && Node.isBinaryExpression(expr)
           && expr.getOperatorToken().getText() === "="
           && Node.isIdentifier(expr.getLeft())) {
         const target = expr.getLeft().getText();
-        const tsType = havocMatch[1]?.trim() ?? _eraseGenerics(typeToString(expr.getLeft().getType()));
+        const tsType = havoc.type ?? _eraseGenerics(typeToString(expr.getLeft().getType()));
         result.push({ kind: "assign", target, value: { kind: "havoc", tsType }, line });
         continue;
       }
@@ -1884,6 +1904,11 @@ function extractFunctionInner(fn: FunctionDeclaration, parentAnnotations?: Annot
         return "void";  // Promise<void>
       }
       const node = fn.getReturnTypeNode();
+      // A type predicate (`x is T` / `asserts x is T`) is a `boolean` at
+      // runtime; the narrowing it performs is a TS-only refinement with no
+      // counterpart in the model. Without this, `getText()` yields "x is T"
+      // and the type mapper reads the subject name as an opaque type.
+      if (node && node.getKind() === SyntaxKind.TypePredicate) return "boolean";
       if (node && Node.isUnionTypeNode(node)) return _eraseGenerics(_tsTypeFromUnionNode(node));
       if (node) return _eraseGenerics(node.getText());
       const inferred = fn.getReturnType();
@@ -2334,6 +2359,26 @@ export function extractModule(sourceFile: SourceFile): RawModule {
         }
       }
     }
+    // A constant's initializer can reference other constants
+    // (`const ZERO_NINE = ZERO + nthDigit(-1)`). Close over those initializers
+    // before filtering — mirroring the transitive type filter below — or a
+    // constant reachable only from another constant is dropped and the backend
+    // sees an undefined name.
+    // Snapshot first: what the closure adds are VALUE references, and a value
+    // and a type can share a name (`const Action = Schema.Literals(…)` next to
+    // `type Action = Schema.Schema.Type<typeof Action>`). Keeping the constant
+    // alive must not also drag in the unrelated type alias, so the type filter
+    // below runs off the pre-closure set.
+    const typeReferencedNames = new Set(referencedNames);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const c of constants) {
+        if (!referencedNames.has(c.name)) continue;
+        const before = referencedNames.size;
+        collectNamesExpr(c.value);
+        if (referencedNames.size !== before) grew = true;
+      }
+    }
     constants.splice(0, constants.length, ...constants.filter(c => referencedNames.has(c.name)));
     // Filter types to only those referenced by verified functions (transitive)
     const neededTypes = new Set<string>();
@@ -2348,7 +2393,7 @@ export function extractModule(sourceFile: SourceFile): RawModule {
         for (const f of v.fields)
           for (const m of f.tsType.matchAll(/\b([A-Z]\w*)\b/g)) markType(m[1]);
     }
-    for (const name of referencedNames) markType(name);
+    for (const name of typeReferencedNames) markType(name);
     // Signature types also mark their base after stripping array/optional
     // WRAPPERS (`Out[]`/`Msg | undefined` → `Out`/`Msg`), so a function returning
     // a local `Out[]` keeps `Out`. Wrappers only — never dig into generic args

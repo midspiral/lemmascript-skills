@@ -239,7 +239,10 @@ function kindHelperDecl(decl: TypeDeclInfo): Decl {
  *  arm body would still be captured, so prime on any module-wide collision.
  *  Deterministic, so the pattern binder and its body substitutions agree. */
 function matchBinder(fieldName: string, prefix?: string): string {
-  return freshName(prefix ? `_${prefix}_${fieldName}` : `_${fieldName}`);
+  const safePrefix = prefix === "\\result"
+    ? "result"
+    : prefix?.replace(/[^A-Za-z0-9_]/g, "_");
+  return freshName(safePrefix ? `_${safePrefix}_${fieldName}` : `_${fieldName}`);
 }
 
 /** Build a match arm pattern like `.VariantName _v_field1 _v_field2` from variant info. */
@@ -365,19 +368,32 @@ function flattenLambdaBody(stmts: Stmt[]): Expr | null {
  */
 
 /** JS truthiness coercion for `if`/`while`/`?:` conditions.
- *  Dafny requires bool; coerce number→`≠0`, string→non-empty, array→`true`
+ *  Dafny requires bool; coerce number→`!== 0`, string→non-empty, array→`true`
  *  (every array, even `[]`, is truthy in JS).
- *  Optional conds are handled separately by narrow.ts (rewritten to someMatch). */
-function coerceCondToBool(cond: Expr, ty: Ty): Expr {
-  if (ty.kind === "bool") return cond;
-  if (ty.kind === "int" || ty.kind === "nat")
-    return { kind: "binop", op: "≠", left: cond, right: { kind: "num", value: 0 } };
-  if (ty.kind === "string")
-    return { kind: "binop", op: ">", left: { kind: "field", obj: cond, field: "length" }, right: { kind: "num", value: 0 } };
+ *
+ *  Rewrites the typed tree, before lowering, and distributes over `&&`/`||`:
+ *  each operand of a logical connective is itself in condition position, and the
+ *  operands need not share a type — `i >= 0 && carry`, with `carry` an int, is a
+ *  bool conjoined with a number. A conjunction takes its type from its right
+ *  operand (resolve), so coercing the whole expression by its type would emit
+ *  `((i >= 0) && carry) != 0`, which is not well-typed.
+ *
+ *  Optional conds never arrive here — narrow.ts rewrites them to someMatch. */
+function asCondition(e: TExpr): TExpr {
+  const bool: Ty = { kind: "bool" };
+  if (e.ty.kind === "bool") return e;
+  if (e.kind === "binop" && (e.op === "&&" || e.op === "||"))
+    return { ...e, left: asCondition(e.left), right: asCondition(e.right), ty: bool };
+  if (e.ty.kind === "int" || e.ty.kind === "nat")
+    return { kind: "binop", op: "!==", left: e, right: { kind: "num", value: 0, ty: e.ty }, ty: bool };
+  if (e.ty.kind === "string")
+    return { kind: "binop", op: ">",
+      left: { kind: "field", obj: e, field: "length", ty: { kind: "nat" } },
+      right: { kind: "num", value: 0, ty: { kind: "nat" } }, ty: bool };
   // Arrays, objects, maps, sets, tuples are always truthy in JS (even `[]`/`{}`).
-  if (["array", "user", "map", "set", "tuple"].includes(ty.kind))
-    return { kind: "bool", value: true };
-  return cond;
+  if (["array", "user", "map", "set", "tuple"].includes(e.ty.kind))
+    return { kind: "bool", value: true, ty: bool };
+  return e;
 }
 
 /** Wrap an expression in Some/None for optional-typed conditionals.
@@ -797,6 +813,12 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
           }
         }
       }
+      // String.fromCharCode(n) → preamble function (inverse of charCodeAt,
+      // which lowers to `(s[i] as int)`).
+      if (e.fn.kind === "field" && e.fn.obj.kind === "var" && e.fn.obj.name === "String" &&
+          e.fn.field === "fromCharCode" && e.args.length === 1) {
+        return { kind: "app", fn: "StringFromCharCode", args: [lowerExpr(e.args[0], binds)] };
+      }
       // Math.abs/min/max → preamble functions
       if (e.fn.kind === "field" && e.fn.obj.kind === "var" && e.fn.obj.name === "Math") {
         if (e.fn.field === "abs" && e.args.length === 1)
@@ -1024,7 +1046,7 @@ function lowerExpr(e: TExpr, binds: Stmt[] | null): Expr {
       // JS truthiness coercion (string/array/int → ... > 0).  Matches SPEC §3.1
       // negation forms (`!s` → `s == ""`).  Optional conds are already
       // rewritten to someMatch by narrow.ts.
-      const cond = coerceCondToBool(lowerExpr(e.cond, binds), e.cond.ty);
+      const cond = lowerExpr(asCondition(e.cond), binds);
       let thenExpr = lowerExpr(e.then, binds);
       let elseExpr = lowerExpr(e.else, binds);
       if (e.ty.kind === "optional") {
@@ -1356,6 +1378,11 @@ function matchToIfChains(stmts: Stmt[]): Stmt[] {
 
     const scrutExpr: Expr = s.scrutinee;
     const defaultArm = arms.find(a => a.pattern.kind === "wild");
+    const declaredCtors = decl.kind === "discriminated-union"
+      ? decl.variants?.map(v => v.name)
+      : decl.kind === "string-union" ? decl.values : undefined;
+    const coveredCtors = new Set(ctorArms.map(a => patternCtor(a.pattern)).filter((c): c is string => !!c));
+    const exhaustiveWithoutDefault = !defaultArm && !!declaredCtors && declaredCtors.every(c => coveredCtors.has(c));
     let elseBranch: Stmt[] = defaultArm ? defaultArm.body : [];
     for (let k = ctorArms.length - 1; k >= 0; k--) {
       const armBody = ctorArms[k].body;
@@ -1382,6 +1409,13 @@ function matchToIfChains(stmts: Stmt[]): Stmt[] {
           value: { kind: "field", obj: scrutExpr, field: f.name, fromUnion: decl.name, ctor },
         });
       });
+      // An exhaustive source match has no fallthrough. Use its final arm as
+      // the unconditional else branch; emitting `else pure ()` would force a
+      // Unit result even when every arm returns the method's result type.
+      if (exhaustiveWithoutDefault && k === ctorArms.length - 1) {
+        elseBranch = [...lets, ...armBody];
+        continue;
+      }
       elseBranch = [{ kind: "if", cond, then: [...lets, ...armBody], else: elseBranch }];
     }
     return elseBranch;
@@ -1731,14 +1765,14 @@ function transformStmt(s: TStmt, typeDecls: TypeDeclInfo[]): Stmt[] {
 
     case "if": {
       // Lift from condition only (Lean rule: don't lift from branches).
-      const { binds, expr: cond } = liftMethodCalls(s.cond);
-      return [...binds, { kind: "if", cond: coerceCondToBool(cond, s.cond.ty), then: transformStmts(s.then, typeDecls), else: transformStmts(s.else, typeDecls) }];
+      const { binds, expr: cond } = liftMethodCalls(asCondition(s.cond));
+      return [...binds, { kind: "if", cond, then: transformStmts(s.then, typeDecls), else: transformStmts(s.else, typeDecls) }];
     }
 
     case "while":
       return [{
         kind: "while",
-        cond: coerceCondToBool(transformExpr(s.cond), s.cond.ty),
+        cond: transformExpr(asCondition(s.cond)),
         invariants: s.invariants.map(transformExpr),
         decreasing: s.decreases ? transformExpr(s.decreases) : null,
         doneWith: s.doneWith ? transformExpr(s.doneWith) : null,
@@ -1977,13 +2011,69 @@ function replaceFieldsInTStmts(
 }
 
 /** Replace all variant fields of obj → match binder vars in typed IR.
- *  Thin wrapper around replaceFieldsInTStmts for discriminant match/switch. */
+ *  Before replacing field reads, realize TypeScript's structural argument
+ *  conversion for calls such as `helper(outcome)` inside a narrowed union arm.
+ *  The source value is still the enclosing union in typed IR, while Dafny and
+ *  Lean expect the helper's nominal record. Rebuild that record solely from
+ *  the fields bound by this arm's match pattern. */
 function replaceFieldAccessInTStmts(stmts: TStmt[], varName: string, fields: { name: string; tsType: string; type?: Ty }[]): TStmt[] {
-  return replaceFieldsInTStmts(stmts, varName, fields.map(f => ({
+  const projected = projectStructuralCallArgsInTStmts(stmts, varName, fields);
+  return replaceFieldsInTStmts(projected, varName, fields.map(f => ({
     fieldName: f.name,
     newName: matchBinder(f.name, varName),
     fallbackTy: f.type ?? parseTsType(f.tsType),
   })));
+}
+
+/** Project a narrowed union scrutinee into a named structural record expected
+ *  by a same-module/extern call. Resolution stamps named calls with paramTys;
+ *  this pass fires only when every target record field has an identically typed
+ *  match-bound source field. That deliberately avoids inventing a broad cast:
+ *  it is the nominal-backend witness for the structural call TS already accepts. */
+function projectStructuralCallArgsInTStmts(
+  stmts: TStmt[], varName: string,
+  fields: { name: string; tsType: string; type?: Ty }[],
+): TStmt[] {
+  const sourceFields = fields.map(f => ({
+    ...f,
+    resolvedTy: f.type ?? parseTsType(f.tsType),
+  }));
+
+  return stmts.map(s => mapTStmt(s, e => {
+    if (e.kind !== "call" || !e.paramTys) return null;
+    const paramTys = e.paramTys;
+    let changed = false;
+    const args = e.args.map((arg, i) => {
+      if (arg.kind !== "var" || arg.name !== varName || i >= paramTys.length) return arg;
+      const targetTy = paramTys[i];
+      const targetDecl = declOfTy(_typeDecls, targetTy);
+      if (targetTy.kind !== "user" || targetDecl?.kind !== "record" || !targetDecl.fields) return arg;
+
+      const matched: { targetField: typeof targetDecl.fields[number]; sourceField: typeof sourceFields[number] }[] = [];
+      for (const targetField of targetDecl.fields) {
+        const sourceField = sourceFields.find(f => f.name === targetField.name);
+        const targetFieldTy = targetField.type ?? parseTsType(targetField.tsType);
+        if (!sourceField || !tyEqual(sourceField.resolvedTy, targetFieldTy)) return arg;
+        matched.push({ targetField, sourceField });
+      }
+
+      changed = true;
+      return {
+        kind: "record" as const,
+        spread: null,
+        fields: matched.map(m => ({
+          name: m.targetField.name,
+          value: {
+            kind: "var" as const,
+            name: matchBinder(m.sourceField.name, varName),
+            ty: m.sourceField.resolvedTy,
+          },
+        })),
+        ty: targetTy,
+      };
+    });
+    return changed ? { ...e, args } : null;
+  }));
 }
 
 /** Replace obj.field → replacement var in typed IR expressions (before lowering).
@@ -2083,7 +2173,7 @@ function transformPureBody(stmts: TStmt[], typeDecls: TypeDeclInfo[]): Expr | nu
         const elseStmts = s.else.length > 0 ? [...s.else, ...rest] : rest;
         const elseExpr = transformPureBody(elseStmts, typeDecls);
         if (!elseExpr) return null;
-        return { kind: "if", cond: coerceCondToBool(transformExpr(s.cond), s.cond.ty), then: thenExpr, else: elseExpr };
+        return { kind: "if", cond: transformExpr(asCondition(s.cond)), then: thenExpr, else: elseExpr };
       }
       case "switch": return transformPureSwitch(s, typeDecls);
       case "someMatch": {
@@ -2130,7 +2220,8 @@ function transformPureSwitch(s: TStmt & { kind: "switch" }, typeDecls: TypeDeclI
   const cases = s.cases.map(c => ({ name: c.label, body: c.body }));
   const arms = buildMatchArms(cases, varName, typeName, typeDecls,
     (body, vn, fields, ctorName) => {
-      let result = transformPureBody(body, typeDecls);
+      const projected = vn ? projectStructuralCallArgsInTStmts(body, vn, fields) : body;
+      let result = transformPureBody(projected, typeDecls);
       if (!result) return null;
       if (fields.length > 0 && vn) result = replaceFieldAccess(result, vn, fields, ctorName, tyBaseName(typeName));
       return result;
@@ -2154,7 +2245,8 @@ function transformPureMatch(chain: Chain, typeDecls: TypeDeclInfo[]): Expr | nul
   const isSynthArrayUnion = decl?.discriminant === "__isArray__";
   const arms = buildMatchArms(cases, chain.varName, chain.typeName, typeDecls,
     (body, vn, fields, ctorName) => {
-      let result = transformPureBody(body, typeDecls);
+      const projected = vn ? projectStructuralCallArgsInTStmts(body, vn, fields) : body;
+      let result = transformPureBody(projected, typeDecls);
       if (!result) return null;
       if (fields.length > 0 && vn) result = replaceFieldAccess(result, vn, fields, ctorName, tyBaseName(chain.typeName));
       if (isSynthArrayUnion && fields.length === 1 && vn) {
@@ -2171,7 +2263,8 @@ function transformPureMatch(chain: Chain, typeDecls: TypeDeclInfo[]): Expr | nul
     const remaining = remainingVariant(chain.typeName, chain.cases, typeDecls);
     if (remaining) {
       // Exactly one variant left — destructure for variant-specific field access.
-      let body = transformPureBody(chain.fallthrough, typeDecls);
+      const projected = projectStructuralCallArgsInTStmts(chain.fallthrough, chain.varName, remaining.fields);
+      let body = transformPureBody(projected, typeDecls);
       if (!body) return null;
       if (remaining.fields.length > 0) body = replaceFieldAccess(body, chain.varName, remaining.fields, remaining.name, tyBaseName(chain.typeName));
       if (isSynthArrayUnion && remaining.fields.length === 1) {

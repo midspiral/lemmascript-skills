@@ -84,6 +84,22 @@ const DAFNY_KEYWORDS = new Set([
 // *same* name, so escapeName routes it here.
 let _resultName = "res";
 
+// User-type names appearing as the type of a havoc anywhere in the module —
+// populated per file by emitDafnyFile, read by the opaque-type case.
+const _havocedTypeNames = new Set<string>();
+
+/** Collect the user-type names of every havoc in a decl tree. */
+function collectHavocedTypeNames(v: unknown, out: Set<string>): void {
+  if (Array.isArray(v)) {
+    for (const x of v) collectHavocedTypeNames(x, out);
+    return;
+  }
+  if (v === null || typeof v !== "object") return;
+  const n = v as { kind?: string; type?: Ty };
+  if (n.kind === "havoc" && n.type?.kind === "user") out.add(n.type.name);
+  for (const x of Object.values(v)) collectHavocedTypeNames(x, out);
+}
+
 // ── Dafny name allocation ──────────────────────────────────
 //
 // freshName (names.ts) freshens in the *raw TS* namespace — but that is not the
@@ -144,6 +160,13 @@ function escapeName(name: string): string {
   const user = _userDafnyNames.get(name);
   if (user !== undefined) return user;
   return escapeGeneratedName(name);
+}
+
+function isEmittedUserName(name: string): boolean {
+  for (const emitted of _userDafnyNames.values()) {
+    if (emitted === name) return true;
+  }
+  return false;
 }
 
 /** Allocate a toolchain-generated name (an ANF temp, a comprehension binder, a
@@ -412,6 +435,7 @@ function emitExpr(e: Expr): string {
         if (e.method === "includes") { needPreamble("StringIndexOf"); return `(StringIndexOf(${obj}, ${args[0]}) >= 0)`; }
         if (e.method === "startsWith") return `(|${obj}| >= |${args[0]}| && ${obj}[..|${args[0]}|] == ${args[0]})`;
         if (e.method === "charCodeAt") return `(${obj}[${args[0]}] as int)`;
+        if (e.method === "repeat") { needPreamble("StringRepeat"); return `StringRepeat(${obj}, ${args[0]})`; }
       }
       // Map methods
       if (ty === "map") {
@@ -473,7 +497,7 @@ function emitExpr(e: Expr): string {
       // Discriminant check: x == .Ctor → x.Ctor?
       const op = mapOp(e.op);
       if ((op === "==" || op === "!=") && e.right.kind === "constructor") {
-        const ctorName = escapeName(e.right.name.replace(/^\./, ""));
+        const ctorName = dafnyCtorName(e.right.name.replace(/^\./, ""));
         const pred = `${emitExpr(e.left)}.${ctorName}?`;
         return op === "!=" ? `(!${pred})` : pred;
       }
@@ -531,6 +555,7 @@ function emitExpr(e: Expr): string {
       if (e.fn === "JSStringLt") needPreamble("JSStringLt");
       if (e.fn === "CeilReal") needPreamble("CeilReal");
       if (e.fn === "FloorReal") needPreamble("FloorReal");
+      if (e.fn === "StringFromCharCode") needPreamble("StringFromCharCode");
       if (e.fn === "NatToString") needPreamble("NatToString");
       if (e.fn === "IntToString") { needPreamble("NatToString"); needPreamble("IntToString"); }
       if (e.fn === "MathAbs") needPreamble("MathAbs");
@@ -545,7 +570,12 @@ function emitExpr(e: Expr): string {
       // tags come from source strings ("spec-pure") that escapeName leaves alone.
       if (e.ctorOf) {
         const ctor = dafnyCtorName(e.fn);
-        return _ambiguousCtors.has(e.fn)
+        // A source local may have the same name as a discriminated-union
+        // variant (`const error = ...; return { kind: "error", error }`).
+        // The bare `error(error)` is then parsed as a call through the local.
+        // Qualify whenever the emitted constructor spelling is already claimed
+        // in the user namespace, as well as when two datatypes share it.
+        return _ambiguousCtors.has(e.fn) || isEmittedUserName(ctor)
           ? `${e.ctorOf}.${ctor}(${args.join(", ")})`
           : `${ctor}(${args.join(", ")})`;
       }
@@ -810,7 +840,10 @@ function emitDecl(d: Decl): string {
     case "opaque-type": {
       // Abstract type — no definition. `(==)` so it can sit inside datatypes
       // that derive structural equality. Never constructed or destructured.
-      return `type ${escapeName(d.name)}(==)`;
+      // `0` (auto-init) only when a havoc of this type needs a witness to
+      // satisfy definite assignment — `var x: T := *` requires it.
+      const autoInit = _havocedTypeNames.has(d.name) ? ", 0" : "";
+      return `type ${escapeName(d.name)}(==${autoInit})`;
     }
 
     case "def": {
@@ -1227,6 +1260,29 @@ const STRING_TO_UPPER = `function StringToUpper(s: string): string
     [upper] + StringToUpper(s[1..])
 }`;
 
+// `String.fromCharCode(n)` — the inverse of `s.charCodeAt(i)`'s `(s[i] as int)`.
+// Dafny's `char` is a Unicode scalar value, so the argument must miss the
+// surrogate range; that is the `requires`, discharged at each call site. The two
+// `ensures` give callers the round-trip law without unfolding the body.
+const STRING_FROM_CHAR_CODE = `function StringFromCharCode(n: int): string
+  requires 0 <= n < 0xD800 || 0xE000 <= n < 0x110000
+  ensures |StringFromCharCode(n)| == 1
+  ensures (StringFromCharCode(n)[0] as int) == n
+{
+  [n as char]
+}`;
+
+// `s.repeat(n)` — n copies of s, concatenated. The per-index ensures is stated
+// for the single-character receiver (the common case: padding with one digit).
+const STRING_REPEAT = `function StringRepeat(s: string, n: int): string
+  requires n >= 0
+  ensures |StringRepeat(s, n)| == |s| * n
+  ensures |s| == 1 ==> forall i :: 0 <= i < n ==> StringRepeat(s, n)[i] == s[0]
+  decreases n
+{
+  if n == 0 then "" else s + StringRepeat(s, n - 1)
+}`;
+
 const MATH_MIN = `function MathMin(a: int, b: int): int { if a <= b then a else b }`;
 const MATH_MAX = `function MathMax(a: int, b: int): int { if a >= b then a else b }`;
 
@@ -1353,6 +1409,8 @@ const PREAMBLE_CODE: [string, string][] = [
   ["StringTrim", STRING_TRIM],
   ["StringToLower", STRING_TO_LOWER],
   ["StringToUpper", STRING_TO_UPPER],
+  ["StringFromCharCode", STRING_FROM_CHAR_CODE],
+  ["StringRepeat", STRING_REPEAT],
   ["NatToString", NAT_TO_STRING],
   ["IntToString", INT_TO_STRING],
   ["MathAbs", MATH_ABS],
@@ -1470,6 +1528,8 @@ export function emitDafnyFile(file: Module, tsFileName?: string, opts?: { safeSl
   resetDafnyNameCache();
   buildRecordCtorMap(file.decls);
   _neededPreambles.clear();
+  _havocedTypeNames.clear();
+  collectHavocedTypeNames(file.decls, _havocedTypeNames);
 
   // Track successfully emitted pure defs — method wrappers are only
   // skipped when the corresponding pure def was actually emitted.

@@ -1,7 +1,7 @@
 # LemmaScript — Implementation Specification
 
-**Version:** 0.5.19
-**Date:** July 2026
+**Version:** 0.5.20
+**Date:** August 2026
 
 Backend-specific details:
 - [SPEC_LEAN.md](SPEC_LEAN.md) — Lean backend (Velvet/Loom, four-file scheme, proof workflow)
@@ -884,6 +884,34 @@ match pkt {
 
 **Field binding:** Property accesses on the matched variable (`pkt.seq`, `pkt.len`) become bound variables from the match pattern. Unused fields get `_`.
 
+**Structural helper arguments from a narrowed arm:** TypeScript may pass the
+matched arm value to a helper that exposes only an untagged structural view:
+
+```typescript
+interface RpcErrorView { code: number; message: string; data?: unknown }
+type Outcome =
+  | { kind: "rpc-error"; code: number; message: string; data?: unknown }
+  | { kind: "done" };
+
+function classify(error: RpcErrorView): number { return error.code; }
+
+function route(outcome: Outcome): number {
+  switch (outcome.kind) {
+    case "rpc-error": return classify(outcome);
+    case "done": return 0;
+  }
+}
+```
+
+Dafny and Lean records are nominal, so the `rpc-error` arm lowers the call by
+constructing `RpcErrorView` from that arm's match-bound `code`, `message`, and
+`data` fields. The rule is deliberately narrower than general TypeScript
+structural subtyping: the argument must be the arm's scrutinee variable, the
+callee must have resolved parameter types, the target must be a named record,
+and every target field must exist in the arm with the same resolved type. Extra
+arm fields (notably the discriminant) are ignored. The rule applies to pure and
+method bodies; arbitrary structural assignments and casts are not synthesized.
+
 **Switch fall-through:** a non-empty `case` must end in `break`/`return`/`throw` — C-style fall-through into the next case's body is rejected. Empty `case A: case B: body` stacking (leading labels sharing the next body) is supported.
 
 **Enum-like types** (string literal unions, no data fields) stay as `if` with constructor equality. Only discriminated unions with data fields trigger the if-chain → match transformation.
@@ -1158,6 +1186,11 @@ datatype EffectState = EffectState(res: bool, done: bool, rec: bool)
 
 **Field access** passes through directly: `state.res` → `state.res` (both backends).
 
+**Structural assignability:** Backend record types remain nominal; LemmaScript
+does not implement general TypeScript structural subtyping. The supported
+exception is the type-directed projection of a narrowed discriminated-union arm
+into a named record parameter described in §4.4.
+
 **Object literals:**
 
 ```typescript
@@ -1328,5 +1361,5 @@ Each phase (and the three intermediate representations — Raw IR, Typed IR, IR)
 The following TS features are not yet handled by the toolchain:
 
 - `await` / true async — a `Promise<T>`-returning function with an `await` in its body is unmodellable. An `async` function with **no** `await` is supported: its `Promise<T>` return type is unwrapped to `T` (the wrapper is just calling convention), so the body verifies normally.
+- **IEEE 754 semantics.** `number` is modeled as a mathematical integer (or, where annotated, an exact `real` — §6.1.3), never as a double, so double-specific behavior is outside the model and *not* covered by a proof: there is no 53-bit precision bound (`2**53 + 1 !== 2**53` is provable in the model, false at runtime), Dafny's `real` is exact rather than rounding (`0.1 + 0.2 == 0.3` verifies), `NaN`/`Infinity`/`-0` have no representation (a possibly-zero divisor is a proof obligation, not `Infinity`), and bitwise operators on `number` get the unbounded lowering of §6.1.1 with no int32 wrap. The pieces that *are* JS-faithful are called out where they occur: real `/` (§6.1.3), `JSRem` for `%`, `JSTruncDiv` for `bigint /`, `JSFloorDiv` for `Math.floor(a / b)`. `**`, `>>>`, and `Math.round`/`trunc`/`sqrt`/`pow` have no lowering at all.
 - Error reporting (mapping prover errors to TS source locations)
-- VS Code extension
