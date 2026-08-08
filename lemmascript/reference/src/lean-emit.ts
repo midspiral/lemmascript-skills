@@ -201,9 +201,11 @@ function leanCtorName(name: string): string {
   return /^[A-Za-z_][A-Za-z0-9_'!?]*$/.test(name) ? name : `«${name}»`;
 }
 
-/** Render a match pattern to Lean syntax: `_`, `.none`, `.some x`, `.syn seq`. */
+/** Render a match pattern to Lean syntax: `_`, a quoted literal, or `.ctor args`. */
 function renderLeanPattern(p: MatchPattern): string {
-  return p.kind === "wild" ? "_" : "." + [leanCtorName(p.ctor), ...p.binders].join(" ");
+  if (p.kind === "wild") return "_";
+  if (p.kind === "literal") return emitExpr({ kind: "str", value: p.value });
+  return "." + [leanCtorName(p.ctor), ...p.binders].join(" ");
 }
 
 // A Bool-valued atom that does NOT coerce to Prop: an inlined union discriminator
@@ -340,9 +342,28 @@ function emitExpr(e: Expr, parentPrec?: number): string {
       const obj = emitExpr(e.obj);
       const wrap = e.obj.kind === "binop" || e.obj.kind === "app" || e.obj.kind === "methodCall" || e.obj.kind === "if" || e.obj.kind === "let";
       const receiver = wrap ? `(${obj})` : obj;
-      const args = e.args.map(a =>
-        (a.kind === "binop" || a.kind === "unop" || a.kind === "implies" || a.kind === "app" || a.kind === "methodCall") ? `(${emitExpr(a)})` : emitExpr(a)
-      );
+      // Predicate-taking array methods require a Bool-valued callback even when
+      // the surrounding expression returns an array/option rather than Bool.
+      // Usually Lean can coerce a decidable Prop-valued predicate. A predicate
+      // containing a raw Bool match cannot be coerced through ∧/∨/¬, though, so
+      // switch just that callback to computational connectives. This is local:
+      // setting the enclosing definition's Bool context would incorrectly
+      // affect unrelated arguments and would still miss predicates inside an
+      // Array-returning definition such as `xs.filter(...)`.
+      const predicateMethod = e.objTy.kind === "array" &&
+        ["filter", "every", "some", "find"].includes(e.method);
+      const args = e.args.map((a, i) => {
+        const prevBoolCtx = _boolCtx;
+        if (predicateMethod && i === 0) _boolCtx = prevBoolCtx || needsBoolConnectives(a);
+        let rendered: string;
+        try {
+          rendered = emitExpr(a);
+        } finally {
+          _boolCtx = prevBoolCtx;
+        }
+        return (a.kind === "binop" || a.kind === "unop" || a.kind === "implies" || a.kind === "app" || a.kind === "methodCall")
+          ? `(${rendered})` : rendered;
+      });
       return emitMethodCall(e.objTy.kind, e.method, e.monadic, receiver, args);
     }
 
