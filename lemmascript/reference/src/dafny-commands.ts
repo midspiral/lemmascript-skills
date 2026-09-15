@@ -23,7 +23,7 @@ export function dafnyCheckDiff(genPath: string, dfyPath: string): boolean {
   if (!existsSync(dfyPath)) return true;
   let diff = "";
   try {
-    diff = execFileSync("git", ["diff", "--no-index", "--", genPath, dfyPath], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    diff = execFileSync("git", ["diff", "--no-index", "--minimal", "--", genPath, dfyPath], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
   } catch (e: any) {
     // git diff exits 1 when files differ; stdout still holds the diff
     if (e && e.stdout != null) {
