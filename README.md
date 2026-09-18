@@ -8,6 +8,7 @@ Agent skills for the [LemmaScript](https://github.com/midspiral/LemmaScript) too
 - **`lemmascript-design-doc`** — create a DESIGN.md for a verified app.
 - **`lemmascript-proof-review`** — audit verified proofs against the design document.
 - **`lemmascript-verified-codebase-rules`** — rules that bind any change (UI, API, refactor) in a codebase containing verified files, so the verification boundary doesn't erode. (Replaces the deprecated `lemmascript-verified-codebase`.)
+- **`lemmascript-dafny-extract-counterexample`** — diagnose failed Dafny proofs with candidate inputs and intermediate states.
 
 All shipped skills are `lemmascript*`-prefixed: consumers can keep their own skills alongside without collisions, and ownership is legible in a directory listing.
 
