@@ -20,21 +20,46 @@ export function dafnyGen(genPath: string, dfyPath: string, text: string) {
 }
 
 export function dafnyCheckDiff(genPath: string, dfyPath: string): boolean {
-  if (!existsSync(dfyPath)) return true;
-  let diff = "";
-  try {
-    diff = execFileSync("git", ["diff", "--no-index", "--minimal", "--", genPath, dfyPath], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-  } catch (e: any) {
-    // git diff exits 1 when files differ; stdout still holds the diff
-    if (e && e.stdout != null) {
-      diff = typeof e.stdout === "string" ? e.stdout : e.stdout.toString("utf-8");
-    } else {
-      // git couldn't be spawned: the check never ran, so fail loud, don't green-pass.
-      console.error(`ERROR: could not run \`git diff\` to verify ${path.basename(dfyPath)} is additions-only (is git installed?)`);
+  for (const filePath of [genPath, dfyPath]) {
+    if (!existsSync(filePath)) {
+      console.error(`ERROR: cannot verify additions-only diff; file does not exist: ${filePath}`);
       return false;
     }
   }
-  const deletions = diff.split("\n").filter(l => l.startsWith("-") && !l.startsWith("---"));
+
+  let diff = "";
+  try {
+    diff = execFileSync(
+      "git",
+      ["diff", "--no-index", "--minimal", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--", genPath, dfyPath],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+  } catch (e: any) {
+    // `git diff --no-index` exits 1 for a valid, non-empty comparison. Every
+    // other exit shape means the comparison did not complete, even when git
+    // happened to return partial stdout.
+    const status = e?.status;
+    const stdout = typeof e?.stdout === "string" ? e.stdout : "";
+    if (status !== 1 || e?.signal != null || e?.code != null || !stdout.startsWith("diff --git ")) {
+      const detail = typeof e?.stderr === "string" ? e.stderr.trim() : "";
+      console.error(
+        `ERROR: could not run \`git diff\` to verify ${path.basename(dfyPath)} is additions-only` +
+        `${status === undefined ? " (is git installed?)" : ` (git exited ${status})`}` +
+        `${detail ? `: ${detail}` : ""}`,
+      );
+      return false;
+    }
+    diff = stdout;
+  }
+  // Only file headers are metadata. Inside a hunk, even a line beginning
+  // with "---" is a deletion (for example, text inside a multiline string).
+  const deletions: string[] = [];
+  let inHunk = false;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ")) inHunk = false;
+    else if (line.startsWith("@@ ")) inHunk = true;
+    else if (inHunk && line.startsWith("-")) deletions.push(line);
+  }
   if (deletions.length > 0) {
     console.error(`WARNING: ${path.basename(dfyPath)} has modifications to generated lines (not additions-only):`);
     for (const d of deletions.slice(0, 5)) console.error("  " + d);
@@ -113,6 +138,11 @@ export function dafnyRegen(genPath: string, dfyPath: string, basePath: string, t
 
   // 7. Verify (skipped under --no-verify: caller verifies separately)
   if (!noVerify && !dafnyVerify(dfyPath, dir, timeLimit, extraFlags)) {
+    // The clean merge already incorporated this generation into the proof
+    // file. Keep that generation as the next merge anchor even though the
+    // verifier rejected the current proof state; otherwise the next regen
+    // compares against the pre-merge generation and can duplicate declarations.
+    writeFileSync(basePath, text);
     console.error(`FAILED: ${path.basename(dfyPath)} verification failed.`);
     process.exit(1);
   }
