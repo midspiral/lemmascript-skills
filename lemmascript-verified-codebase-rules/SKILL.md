@@ -77,7 +77,7 @@ guarantee someone may be relying on. If a proof genuinely blocks you, that's a d
 
 ### 6. Leave the gate green
 
-`lsc check` with no argument batches over `LemmaScript-files.txt`; that is
+`lsc check --backend=dafny` with no file argument batches over `LemmaScript-files.txt`; that is
 the CI gate. Whatever you changed, it must still pass before you're done —
 including changes that "couldn't possibly" affect the core (moves, renames,
 tsconfig, dependency bumps all can).
