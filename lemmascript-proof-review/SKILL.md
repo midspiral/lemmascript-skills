@@ -46,8 +46,16 @@ re-run claimcheck), not in a fresh PROOF_FINDINGS.md.
      `.dfy` (what proofs were added)
    - Any `*.guarantees.{json,md}` claimcheck artifacts, if present
 
-2. Re-verify with `lsc check` — with no file argument it batches over
-   `LemmaScript-files.txt`; otherwise run it per file. Record the result.
+2. Re-verify with `lsc check --slow` — with no file argument it batches over
+   `LemmaScript-files.txt`; otherwise run it per file. Always pass `--slow`
+   to a batch: without it, an entry whose manifest timeout is over 60s is
+   only gen-checked (generated and gate-checked, never proved), and the run
+   can still exit 0. A batch also stops at the first failing file; after a
+   failure, run each remaining file on its own. A single-file run ignores
+   the manifest line, so pass that line's timeout as `--time-limit=<sec>`
+   and its prover flags as `--extra-flags="…"`. Record a result for every file from the per-file
+   output, not the exit code: a file that printed `gen-check only` or never
+   ran is unverified.
    **Do not substitute raw `dafny verify`**: it can pass on a stale `.dfy`
    that no longer corresponds to the current `.ts`, certifying proofs about
    code that isn't the code. `lsc check` regenerates, enforces the
