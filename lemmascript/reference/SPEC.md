@@ -4,7 +4,7 @@
 **Date:** September 2026
 
 Backend-specific details:
-- [SPEC_LEAN.md](SPEC_LEAN.md) — Lean backend (Velvet/Loom, four-file scheme, proof workflow)
+- [SPEC_LEAN.md](SPEC_LEAN.md) — Lean backend (Velvet 2, four-file scheme, proof workflow)
 - [SPEC_DAFNY.md](SPEC_DAFNY.md) — Dafny backend (two-file scheme, regen workflow)
 
 ---
@@ -15,7 +15,7 @@ LemmaScript is a verification toolchain for TypeScript. The user writes TypeScri
 
 The toolchain has two components:
 1. **`lsc` CLI** (Node.js) — parses TS, generates verification artifacts for the selected backend
-2. **Backend-specific libraries** — Lean: LemmaScript Lean library (re-exports Velvet/Loom). Dafny: helper preambles auto-injected.
+2. **Backend-specific libraries** — Lean: LemmaScript Lean library (re-exports Velvet 2 and supporting Mathlib imports). Dafny: helper preambles auto-injected.
 
 ---
 
@@ -452,6 +452,10 @@ The same coercion applies to non-bool conditions in `if`/`while`/`?:` positions:
 
 ### 3.2 Special Forms
 
+The collection rows show the default `dafny-library: stdlib` setting.
+With `local`, `SeqFilter` and `SeqAll` replace the corresponding
+`Std.Collections.Seq` helpers (§7.6).
+
 | Spec / TS | Lean | Dafny |
 |-----------|------|-------|
 | `arr.length` | `arr.size` | `\|arr\|` |
@@ -682,6 +686,9 @@ The transform uses two strategies for translating `receiver.method(args)`:
 | `s.add(x)` | `setAdd` | `s.insert x` | `(s + {x})` |
 | `s.delete(x)` | `setDelete` | `s.erase x` | `(s - {x})` |
 
+Dafny collection entries use the default `stdlib` setting; `local` uses
+`SeqFilter` and `SeqAll` instead (§7.6).
+
 The transform checks helper-function methods first, then dot-notation methods. If neither matches, it errors.
 
 ### 3.9 Map, Set, and Optional Narrowing
@@ -836,7 +843,7 @@ while condition'
 
 **Decreasing clause:** Emitted directly as a backend expression. Both backends accept well-founded relations — `Nat`/`nat`, lexicographic tuples, etc.
 
-**`done_with` clause:** If the loop body contains `break`, the user should add a `//@ done_with` annotation specifying what is true when the loop exits. (Lean: if omitted, Velvet defaults to the negation of the loop condition, which is only correct when there is no `break`. Dafny: not needed, the verifier handles break paths automatically.)
+**`done_with` clause:** On the Lean backend, a loop containing `break` must have a `//@ done_with` annotation specifying what is true when it exits; `lsc` rejects a missing annotation, including when an early return lowers to a break. Use `//@ done_with true` when the invariants already carry the needed exit facts. Dafny derives break paths automatically and does not require this annotation.
 
 **C-style `for (init; cond; update)` loops** are desugared at extract time to the equivalent `init; while (cond) { body; update; }`. The loop variable from `init` is forced mutable so the update can mutate it. The update is a bare `Expression` in TS (not wrapped in an `ExpressionStatement`), but is routed through the same statement-position desugaring as `i++;` standalone — `i++`/`i--` become `i = i ± 1`, compound assignments become their plain-assignment equivalents. `//@ invariant` and `//@ decreases` annotations placed in the for-loop body carry through to the desugared `while`.
 
@@ -844,7 +851,7 @@ while condition'
 
 **Dafny:** `return` inside loops is supported. Dafny handles early return paths natively.
 
-**Lean:** `return` inside a `while` loop is **not supported** — Velvet does not support it. The user must restructure to use `break` with an explicit result variable:
+**Lean:** For supported outer-loop shapes, `lsc` lowers an early `return` to a result assignment plus `break`, then returns the result after the loop. The function's postconditions become additional loop invariants for that result variable. Add an explicit `//@ done_with` to the TS loop, since the lowering introduces a break. The transformation does not descend into nested loops; unsupported shapes need an explicit result variable and control-flow restructuring, for example:
 
 ```typescript
 let result = -1;
@@ -1020,6 +1027,11 @@ The spec body is purely additive — `regen` three-way-merges and preserves user
 | `<T>` / `<T extends U>` (unbounded, or union/intersection bound) | `T` kept as type param (bound dropped) | `T` kept as type param (bound dropped) |
 | `A \| B` (union param) | field intersection type | field intersection type |
 | Anything else | Pass through | Pass through |
+
+For the Dafny backend, `string` uses Unicode-scalar semantics by default.
+To use JavaScript's UTF-16 code-unit model, select
+`"string-semantics": "javascript-utf16"` and `"dafny-library": "local"`
+(§7.6). See SPEC_DAFNY.md §4 for the behavior and limitations of each model.
 
 `lsc` reads parameter and variable types from ts-morph. Primitive types are mapped per the table. User-defined types (like `State`, `Event`) are passed through by name — the corresponding backend type is generated from the TS type declaration.
 
@@ -1272,7 +1284,7 @@ function runSession(events: Event[]): State {
 }
 ```
 
-Both backends verify this. Lean uses `loom_solve` to discharge all VCs, including the inter-method call. Dafny's Z3 verifier handles it directly.
+Both backends verify this. Lean uses `velvet_vcgen [runSession] with finish` to discharge the VCs, including the inter-method call; `transition` supplies its pure mirror with `finish [Pure.transition]`. Dafny's Z3 verifier handles it directly.
 
 **Example 2: Packet processing (discriminated union with data)**
 
@@ -1310,6 +1322,7 @@ lsc info <file.ts>                             — write a JSON summary of verif
 lsc info --typed <file.ts>                     — print the machine-readable Typed IR contract (stdout)
 lsc config [<file.ts>]                         — print discovered config and effective options
 lsc claimcheck [<file.ts>]                     — check //@ contract prose vs //@ ensures (forwards to lemmascript-claimcheck)
+lsc runs [--json]                              — report what verification caught, from the run log (§7.8)
 lsc version                                    — print the lemmascript package version
 ```
 
@@ -1321,6 +1334,8 @@ Default backend is Dafny. `extract` and `info` are backend-neutral and always ru
 - `--time-limit=<seconds>` — per-VC verification time limit (Dafny: `--verification-time-limit`).
 - `--extra-flags=<string>` — extra flags forwarded verbatim to the backend prover.
 - `--slow` — in batch mode, verify entries whose manifest timeout exceeds 60s (otherwise those get `gen-check`, unless `--time-limit` is supplied).
+
+**Environment:** `LSC_RUN_LOG=false` turns the run log (§7.7) off for one invocation; `true` or unset leaves it to `run-log` in `lemmascript.json`. Any other value is an error. It is the only environment variable `lsc` reads.
 
 In batch mode, `--time-limit` and `--extra-flags` independently override the
 corresponding manifest values; omitted options retain the per-entry settings.
@@ -1335,11 +1350,11 @@ For Dafny `check`, an explicit timeout enables verification even above 60s witho
 ### 7.2 `check`
 
 - **Lean:** gen + `lake build` (checks `.def.lean` + `.proof.lean` + `.spec.lean`)
-- **Dafny:** gen + additions-only check + `dafny verify`
+- **Dafny:** gen + additions-only check + `dafny verify`; the run is recorded in the run log (§7.7)
 
 ### 7.3 `regen` (Dafny only)
 
-Three-way merge when generated code changes. See [SPEC_DAFNY.md](SPEC_DAFNY.md).
+Three-way merge when generated code changes. See [SPEC_DAFNY.md](SPEC_DAFNY.md). Each run, including a conflict or additions-only failure, is recorded in the run log (§7.7).
 
 ### 7.4 `info`
 
@@ -1378,13 +1393,73 @@ it; absent means current behavior. Unknown keys and bad values are errors.
 | `extern-default` | `pure` \| `impure` | `pure` | yes |
 | `safe-slice` | boolean | `false` | yes |
 | `proof-dir` | relative path | source directory | no (Dafny only) |
+| `string-semantics` | `unicode-scalar` \| `javascript-utf16` | `unicode-scalar` | yes (Dafny only) |
+| `dafny-library` | `stdlib` \| `local` | `stdlib` | yes (Dafny only) |
+| `run-log` | boolean | `true` | no (Dafny only) |
 
 Eligible settings use `//@ option <key> <value>` before the first source
 statement. File values override project values; duplicates are errors.
 `proof-dir` mirrors the source's config-relative path under its configured root
-(see SPEC_DAFNY.md §1). `lsc config foo.ts` prints the config path, effective
+(see SPEC_DAFNY.md §1). `string-semantics` selects which model of JavaScript strings a
+Dafny proof is made under (SPEC_DAFNY.md §4). A source file and the source files it
+imports, directly or indirectly, must use the same `string-semantics` value after
+project settings and file overrides are combined. Declaration files (`.d.ts`)
+are excluded from this comparison. If values differ, `lsc` reports both files
+and stops before generating Dafny.
+`dafny-library` selects standard-library
+or generated local helpers for `filter`, `every`, and `reduce`. UTF-16 requires an explicit
+`"dafny-library": "local"`; omitting it keeps the `stdlib` default and reports an incompatibility.
+Unicode-scalar strings support either library choice. `lsc config foo.ts` prints the config path, effective
 options, and resolved Dafny artifact directory; `lsc config` reports defaults
 from the current directory. `backend` is deliberately not a config option.
+
+To use JavaScript UTF-16 string semantics in a standalone file, add these
+directives before its first statement. These overrides are not needed for the
+default `unicode-scalar` mode:
+
+```typescript
+//@ backend dafny
+//@ option string-semantics javascript-utf16
+//@ option dafny-library local
+```
+
+See [examples/utf16.ts](examples/utf16.ts) and its Dafny proof. Compatibility is checked
+after project values and file directives are merged. Collection libraries may differ
+between files; unlike the string model, they do not change the meaning of contracts.
+
+### 7.7 Run log
+
+Every Dafny `check` and `regen` appends one JSON record to `.lemmascript/runs.jsonl`, in the
+directory of the selected `lemmascript.json` (else of the nearest `LemmaScript-files.txt`, else
+the source's git root, else the current directory), and stores the source as
+`.lemmascript/blobs/<hash>.ts`. The directory contains a
+`.gitignore` of `*`, so it never appears in `git status`. A record names the file, the command,
+the stage where the run stopped (`ok`, `verify`, `resolve`, `diff`, `conflict`), the members that
+passed and failed, hashes of the `.ts` and `.dfy`, and `partial: true` when the run did not
+report on every member. Logging never changes `lsc` output or exit codes.
+
+```json
+{ "run-log": false }
+```
+
+turns it off for a project; `LSC_RUN_LOG=false` turns it off for one run.
+
+### 7.8 `runs`
+
+`lsc runs [--json] [--config=<path>]` reads the run log (§7.7) found from the current directory
+and reports **catches**: failures that a later run fixed, one per TypeScript function (a function
+fails while it or its `_ensures` lemma fails, and is fixed when both pass; lsc's generated helpers
+are left out). Each catch compares its
+first failing run with its passing run: a changed `.ts` is a `source-fix`, a changed `.dfy` alone
+is `proof`, and no change is `flaky`. A `source-fix` also carries the diff of the two `.ts`
+snapshots and a hint: `code` or `spec` (`requires`/`ensures`/`contract` lines) changed, both
+(`mixed`), or only proof scaffolding (`proof`). Failures still failing are listed as open; failures
+whose function disappeared are dropped. A member absent from a partial run is never dropped.
+
+Text output summarises the log in local time; `--json` gives the full report, with UTC times and
+the diff evidence. The diff needs `git`: without it, or without a snapshot, the diff and hint are
+`null` (with a warning on stderr when `git` is the cause). Log lines that cannot be read are skipped.
+`lsc runs` reads an existing log even when recording is turned off.
 
 ---
 

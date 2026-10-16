@@ -5,7 +5,7 @@
  * Pipeline: extract → resolve → narrow → transform → peephole → emit
  */
 
-import { Project, ScriptTarget } from "ts-morph";
+import { Project, ScriptTarget, type SourceFile } from "ts-morph";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { execFileSync } from "child_process";
 import { createRequire } from "module";
@@ -21,6 +21,8 @@ import { emitDafnyFile, emittedNameMap } from "./dafny-emit.js";
 import { dafnyGen, dafnyCheckDiff, dafnyVerify, dafnyRegen } from "./dafny-commands.js";
 import { leanGen, leanCheck } from "./lean-commands.js";
 import { runInfo, runTypedInfo, type TypedInfoDafny } from "./info-command.js";
+import { RunLog, resolveLogDir, runLogEnabled } from "./run-log.js";
+import { runRuns } from "./runs-command.js";
 import {
   findUp,
   loadConfigOptions,
@@ -83,6 +85,13 @@ function main() {
         process.exit(1);
       }
     }
+    return;
+  }
+
+  // `lsc runs` reads the run log and takes its own flags (`--json`, `--config=`),
+  // so it is dispatched before the file commands' flag parsing.
+  if (args[0] === "runs") {
+    runRuns(args.slice(1));
     return;
   }
 
@@ -173,6 +182,7 @@ function main() {
     console.error("       lsc info --typed <file.ts>   (machine-readable Typed IR contract to stdout)");
     console.error("       lsc <gen|gen-check|check> [--backend=…] [--slow]   (no file: batch over LemmaScript-files.txt)");
     console.error("       lsc claimcheck [<file.ts>] [flags…]   (forwards to lemmascript-claimcheck)");
+    console.error("       lsc runs [--json] [--config=path]   (what verification caught, from .lemmascript/runs.jsonl)");
     console.error("       lsc version");
     process.exit(1);
   }
@@ -217,6 +227,29 @@ function effectiveOptions(
   const fileOptions = parseFileOptions(sourceText, sourcePath);
   const options = resolveOptions({ ...loaded.explicit, ...fileOptions }, sourcePath);
   return { options, configFile: loaded.configFile };
+}
+
+/** Imported contracts must retain the string model used by their source files. */
+function stringModelValidator(source: SourceFile, options: LscOptions, configPath?: string): (source: SourceFile) => void {
+  const seen = new Set<SourceFile>();
+  return start => {
+    const pending = [start];
+    while (pending.length > 0) {
+      const dependency = pending.pop()!;
+      if (seen.has(dependency)) continue;
+      seen.add(dependency);
+      pending.push(...dependency.getReferencedSourceFiles());
+      // Declaration files describe host APIs; follow re-exports through them,
+      // but compare models only for source files that can carry verified code.
+      if (dependency === source || dependency.isDeclarationFile()) continue;
+      const { options: imported } = effectiveOptions(dependency.getFilePath(), dependency.getFullText(), configPath);
+      if (imported["string-semantics"] !== options["string-semantics"]) {
+        throw new Error(`${source.getFilePath()}: string-semantics=${options["string-semantics"]} differs from `
+          + `${dependency.getFilePath()} (string-semantics=${imported["string-semantics"]}); `
+          + "use the same string model across source dependencies");
+      }
+    }
+  };
 }
 
 /** `lsc config [file.ts]` — report discovery, effective values, and routing. */
@@ -314,6 +347,8 @@ function runFile(
 
   const fullText = sourceFile.getFullText();
   const { options, configFile } = effectiveOptions(absPath, fullText, configPath);
+  // Checked here, for every command, so a bad LSC_RUN_LOG fails like a bad config value.
+  const runLogOn = runLogEnabled(options["run-log"], process.env.LSC_RUN_LOG);
 
   // Check //@ backend directive — skip if backend doesn't match.
   // `extract` and `info` are backend-neutral and always run.
@@ -331,8 +366,13 @@ function runFile(
   const leanModuleDirective = fullText.match(/\/\/@ lean-module ([A-Za-z0-9_.\-]+)/);
   const leanModuleOverride = leanModuleDirective ? leanModuleDirective[1] : undefined;
 
+  // Validate the actual dependency graph, not unrelated files in the tsconfig.
+  // Library selection may differ; only the string model changes contract meaning.
+  const validateDependency = stringModelValidator(sourceFile, options, configPath);
+  validateDependency(sourceFile);
+
   // Extract: ts-morph → Raw IR
-  const raw = extractModule(sourceFile, options);
+  const raw = extractModule(sourceFile, options, validateDependency);
 
   if (cmd === "extract") {
     console.log(JSON.stringify(raw, null, 2));
@@ -392,6 +432,13 @@ function runFile(
     guardRelocatedDafnyProof(dir, artifactDir, base, dfyPath);
     mkdirSync(artifactDir, { recursive: true });
 
+    // Record check/regen runs in the run log. Created after the proof-dir guard
+    // so an aborted run leaves no snapshot; each helper records the stage it detects.
+    const logCmd = cmd === "check" || cmd === "regen" ? cmd : null;
+    const log = logCmd && runLogOn
+      ? new RunLog({ logDir: resolveLogDir(absPath, configFile), cmd: logCmd, sourcePath: absPath, extraFlags, lscVersion: lscVersion() })
+      : undefined;
+
     if (cmd === "gen") { dafnyGen(genPath, dfyPath, text); return; }
     if (cmd === "gen-check") {
       dafnyGen(genPath, dfyPath, text);
@@ -400,16 +447,23 @@ function runFile(
     }
     if (cmd === "check") {
       dafnyGen(genPath, dfyPath, text);
-      if (!dafnyCheckDiff(genPath, dfyPath)) process.exit(1);
-      if (!dafnyVerify(dfyPath, artifactDir, timeLimit, extraFlags)) process.exit(1);
+      if (!dafnyCheckDiff(genPath, dfyPath, log)) process.exit(1);
+      if (!dafnyVerify(dfyPath, artifactDir, timeLimit, extraFlags, log)) process.exit(1);
       return;
     }
-    if (cmd === "regen") { dafnyRegen(genPath, dfyPath, basePath, text, artifactDir, timeLimit, extraFlags, noVerify); return; }
+    if (cmd === "regen") { dafnyRegen(genPath, dfyPath, basePath, text, artifactDir, timeLimit, extraFlags, noVerify, log); return; }
     console.error(`Unknown command: ${cmd}`);
     process.exit(1);
   }
 
   // ── Lean backend ──────────────────────────────────────────
+  // Dafny-only profile: Lean's `String` is a sequence of Unicode scalars and
+  // LemmaScript has no UTF-16 encoding for it (DESIGN_STRINGS.md §4). Refuse
+  // rather than emit scalar Lean for a code-unit claim.
+  if (options["string-semantics"] === "javascript-utf16") {
+    console.error('ERROR: "string-semantics": "javascript-utf16" is not available for --backend=lean; use --backend=dafny or select "unicode-scalar" in lemmascript.json or a //@ option directive.');
+    process.exit(1);
+  }
   const leanBase = leanModuleOverride ?? base;
   const specPath = path.join(dir, `${leanBase}.spec.lean`);
   const specImport = existsSync(specPath) ? `«${leanBase}.spec»` : undefined;
