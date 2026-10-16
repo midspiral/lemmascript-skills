@@ -75,7 +75,12 @@ The `.ts` is the source of truth for **the program**; the `.dfy` is the source o
 
 **Regen, don't rm.** Do not `rm *.dfy* && lsc gen` — that drops every proof addition. `regen` does a three-way merge and preserves them. 
 
-**Stale `.dfy.base` cascade.** A failed `regen` (CONFLICT or verification FAILED) leaves a stale `foo.verify.dfy.base` on disk; the next `regen` anchors on it and mis-merges, appending duplicate declarations → a cascade of `Error: Duplicate member name: ...`. Fix: `rm -f *.dfy.base` and regen again. Keep `*.dfy.base` out of version control.
+**Don't delete `.dfy.base`.** `regen` anchors its merge on `foo.verify.dfy.base` if it exists, otherwise on the previous `.dfy.gen`. What a failed `regen` leaves behind is intentional:
+- Clean merge, verification FAILED: the base advances to the new `.dfy.gen`, because the proof already contains it. Fix the proof and run `regen` again.
+- CONFLICT: the old base is kept and the original proof restored. Inspect `foo.verify.dfy.merged` before retrying.
+- Additions-only failure: the old base is kept. Repair the changed generated lines in the proof.
+
+A successful `regen` removes the base. Never delete it just to make the next command run. To clear it by hand, only after a green check: `lsc check foo.verify.ts && rm -f foo.verify.dfy.base`. Keep `*.dfy.base` out of version control.
 
 **`ensures` for caller composition.** A `//@ ensures` emits a separate `<fn>_ensures` *lemma*; the generated Dafny *function* carries only `requires`/`decreases`. A *function* caller can't invoke a lemma, so it can't see a callee's postcondition. Fix: hand-add the `ensures` to the generated function as an addition (own new lines, above the `{`) — Dafny discharges it inline against the body, even recursively.
 

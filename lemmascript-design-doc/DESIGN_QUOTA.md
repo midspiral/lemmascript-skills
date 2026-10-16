@@ -522,9 +522,9 @@ growing without restructuring it.
   `hasRoom`, and the convergence lemmas; relational lemmas (snoc, monotonicity, homomorphism,
   order-freeness) use the **pure-carrier technique** (TS body `return true`, induction in the
   generated `_ensures`).
-- **Nonlinear-arithmetic caution / `.dfy.base` regen gotcha** — follow Quorum's notes: prove
-  multiplication facts with tiny inductive helpers; `rm -f src/domain.dfy.base` before re-running
-  a `regen` that previously errored.
+- **Nonlinear-arithmetic caution / `.dfy.base` regen** — follow Quorum's notes: prove
+  multiplication facts with tiny inductive helpers; leave `src/domain.dfy.base` in place after
+  a `regen` that errored, since the next `regen` relies on it.
 - **Honest scope:** state each `ensures` precisely and name the trusted edges inline (auth,
   I/O, time labeling, DB-enforced append-only, identity spoofing). No "verified end-to-end"
   claim — we verify the *meaning of the booking decision*, not the whole app.
