@@ -22,7 +22,9 @@ For a whole app, the "verified core" is the domain logic; the shell (UI, I/O, au
 
 ## Workflow
 
-MUST Put `//@ backend dafny` on the first line of every source file. That pins the file to the Dafny backend (a run targeting another backend skips it), and Dafny is already the default — so you never pass `--backend` on the command line.
+MUST Put `//@ backend dafny` on the first line of every source file. That pins the file to the Dafny backend: a run targeting another backend skips it.
+
+MUST Pass `--backend=dafny` on every `lsc` command too. Dafny is the default today, but the default has been flipped before, and if it flips, a file pinned to Dafny is skipped with exit 0: nothing verifies and nothing fails. In this skill and its companions, `lsc gen|gen-check|check|regen` always means with `--backend=dafny`.
 
 MUST Create a `LemmaScript-files.txt` in the root of your project with the paths to every file that should be verified or that has a `//@ verify` annotation (one path per line). Running `lsc gen|gen-check|check` with *no file argument* batches over it — this is what CI runs. Batch behavior and flags: SPEC §7.
 
@@ -63,9 +65,9 @@ LemmaScript-files.txt      lists: src/verified/booking.verify.ts
 
 Inside a file:
 1. Write TypeScript with `//@` annotations (kinds: SPEC §2.1; expression grammar: SPEC §2.2 + §3).
-2. `lsc check <foo.verify.ts>` — generates the Dafny (`foo.verify.dfy.gen`), seeds `foo.verify.dfy` on the first run, enforces the additions-only gate, and verifies. This is the loop, not raw `dafny verify`.
+2. `lsc check --backend=dafny <foo.verify.ts>` — generates the Dafny (`foo.verify.dfy.gen`), seeds `foo.verify.dfy` on the first run, enforces the additions-only gate, and verifies. This is the loop, not raw `dafny verify`.
 3. Iterate on the **proof**: add helpers (lemmas, invariants, asserts) in `foo.verify.dfy` and re-run `lsc check`. Editing only the `.dfy` is a `check`.
-4. When you change the **`.ts`**, the generated Dafny changes — run `lsc regen <foo.verify.ts>`, which merges the new generated code into your `foo.verify.dfy` (preserving proof additions) and verifies. Run `regen` *before* any `check`: `check` regenerates `.dfy.gen` and destroys the merge base `regen` needs.
+4. When you change the **`.ts`**, the generated Dafny changes — run `lsc regen --backend=dafny <foo.verify.ts>`, which merges the new generated code into your `foo.verify.dfy` (preserving proof additions) and verifies. Run `regen` *before* any `check`: `check` regenerates `.dfy.gen` and destroys the merge base `regen` needs.
 
 ## Edit boundaries
 
@@ -75,7 +77,12 @@ The `.ts` is the source of truth for **the program**; the `.dfy` is the source o
 
 **Regen, don't rm.** Do not `rm *.dfy* && lsc gen` — that drops every proof addition. `regen` does a three-way merge and preserves them. 
 
-**Stale `.dfy.base` cascade.** A failed `regen` (CONFLICT or verification FAILED) leaves a stale `foo.verify.dfy.base` on disk; the next `regen` anchors on it and mis-merges, appending duplicate declarations → a cascade of `Error: Duplicate member name: ...`. Fix: `rm -f *.dfy.base` and regen again. Keep `*.dfy.base` out of version control.
+**Don't delete `.dfy.base`.** `regen` anchors its merge on `foo.verify.dfy.base` if it exists, otherwise on the previous `.dfy.gen`. What a failed `regen` leaves behind is intentional:
+- Clean merge, verification FAILED: the base advances to the new `.dfy.gen`, because the proof already contains it. Fix the proof and run `regen` again.
+- CONFLICT: the old base is kept and the original proof restored. Inspect `foo.verify.dfy.merged` before retrying.
+- Additions-only failure: the old base is kept. Repair the changed generated lines in the proof.
+
+A successful `regen` removes the base. Never delete it just to make the next command run. To clear it by hand, only after a green check: `lsc check --backend=dafny foo.verify.ts && rm -f foo.verify.dfy.base`. Keep `*.dfy.base` out of version control.
 
 **`ensures` for caller composition.** A `//@ ensures` emits a separate `<fn>_ensures` *lemma*; the generated Dafny *function* carries only `requires`/`decreases`. A *function* caller can't invoke a lemma, so it can't see a callee's postcondition. Fix: hand-add the `ensures` to the generated function as an addition (own new lines, above the `{`) — Dafny discharges it inline against the body, even recursively.
 

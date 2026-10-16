@@ -1,6 +1,6 @@
 ---
 name: lemmascript-proof-review
-description: Milestone audit of verified LemmaScript proofs against the design document — run at a stopping point (before release, sealing, or making external claims; after a major proof push), not in the edit-prove loop. Runs in a clean agent with no prior context, after lsc check is green and claimcheck has been run. Re-verifies, inventories the trust surface (assume/havoc/extern/skip/autohavoc/selective verify), checks //@ contract coverage and claimcheck artifacts, and produces PROOF_FINDINGS.md. Does not change code.
+description: Milestone audit of verified LemmaScript proofs against the design document — run at a stopping point (before release, sealing, or making external claims; after a major proof push), not in the edit-prove loop. Runs in a clean agent with no prior context, after lsc check is green and claimcheck has been run. Re-verifies, inventories the trust surface (assume/havoc/extern/skip/autohavoc/selective verify), checks //@ contract coverage and claimcheck artifacts, and produces PROOF_FINDINGS.md. Never edits .ts or hand-writes proof; may run lsc regen to bring a stale .dfy up to date.
 ---
 
 # Proof Review
@@ -46,15 +46,38 @@ re-run claimcheck), not in a fresh PROOF_FINDINGS.md.
      `.dfy` (what proofs were added)
    - Any `*.guarantees.{json,md}` claimcheck artifacts, if present
 
-2. Re-verify with `lsc check` — with no file argument it batches over
-   `LemmaScript-files.txt`; otherwise run it per file. Record the result.
+2. Bring stale proofs up to date first. A file has a pending regen when a
+   `.dfy.base` sits next to its `.dfy`, or when `git status` shows its `.ts`
+   changed but not its `.dfy.gen`. Run `lsc regen <file>` on each such file
+   before any `check`: `check` overwrites the `.dfy.gen` that `regen` merges
+   from. If you can't tell, run `regen` anyway; on an up-to-date file it
+   does the same as `check`. Pass the manifest line's timeout and prover
+   flags as in step 3. Record the outcome:
+   - Merged and verified: the file is verified.
+   - Merged, verification FAILED: the file is failing — a finding, like a
+     failed `check`.
+   - CONFLICT: `regen` restores the original `.dfy` and writes
+     `foo.dfy.merged`. Do not resolve it. Record the file as unverified,
+     with the `.dfy.merged` path, and leave the `.dfy.base` in place.
+
+3. Re-verify with `lsc check --slow` — with no file argument it batches over
+   `LemmaScript-files.txt`; otherwise run it per file. Always pass `--slow`
+   to a batch: without it, an entry whose manifest timeout is over 60s is
+   only gen-checked (generated and gate-checked, never proved), and the run
+   can still exit 0. A batch also stops at the first failing file; after a
+   failure, run each remaining file on its own. A single-file run ignores
+   the manifest line, so pass that line's timeout as `--time-limit=<sec>`
+   and its prover flags as `--extra-flags="…"`. Record a result for every file from the per-file
+   output, not the exit code: a file that printed `gen-check only` or never
+   ran is unverified.
    **Do not substitute raw `dafny verify`**: it can pass on a stale `.dfy`
    that no longer corresponds to the current `.ts`, certifying proofs about
    code that isn't the code. `lsc check` regenerates, enforces the
    additions-only gate, and then verifies — that is the only honest baseline
    for an audit.
 
-3. Produce `PROOF_FINDINGS.md` in the project root. Do not modify any code.
+4. Produce `PROOF_FINDINGS.md` in the project root. Do not edit any `.ts`
+   or write any proof; `regen` in step 2 is the only change to a `.dfy`.
 
 ## PROOF_FINDINGS.md structure
 
@@ -129,7 +152,10 @@ what should NOT be claimed yet.
 
 ## Rules
 
-- **Do not change any code.** This is a read-only audit.
+- **Do not change any code.** Never edit a `.ts`, write or fix a proof, or
+  resolve a merge conflict. The only write allowed is `lsc regen` on a
+  stale file (step 2), which merges generated code the `.ts` already
+  implies.
 - Be precise: "the proof shows X" is different from "the code does X."
   Proofs are about the Dafny model. The TypeScript runs the same logic but
   the trust boundary is the TS→Dafny translation.
