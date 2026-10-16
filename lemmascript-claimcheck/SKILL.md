@@ -65,6 +65,6 @@ The loop: `lsc check` (green) → `lsc claimcheck` → fix each **gap**, resolve
 
 ## Caveats
 
-- **Exit code does not reflect findings.** A run with disputed contracts or gaps still exits `0` — non-zero is reserved for usage/file errors. CI **cannot gate on the exit code**; parse `*.guarantees.json` (`summary.disputed`, `summary.gaps`) instead.
+- **Exit code does not reflect findings.** A run with disputed contracts or gaps still exits `0` — non-zero is reserved for usage/file errors. CI **cannot gate on the exit code**; parse `*.guarantees.json` instead and require `summary.disputed === 0`, `summary.gaps === 0`, and `summary.contracts === summary.confirmed + summary.disputed`. `summary` has no unchecked count, so that last check is the only thing that catches unchecked contracts.
 - **Meaning, not proof.** claimcheck never runs Dafny. Green claimcheck on an unverified file proves nothing — always `lsc check` first.
 - **It's an LLM judgment.** Verdicts are a model round-trip, not a theorem. Treat a **disputed** as a prompt to look, not a proof of a bug; a **confirmed** narrows, but doesn't eliminate, the intent–proof gap.
