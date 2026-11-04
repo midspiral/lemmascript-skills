@@ -21,7 +21,7 @@ import { emitDafnyFile, emittedNameMap } from "./dafny-emit.js";
 import { dafnyGen, dafnyCheckDiff, dafnyVerify, dafnyRegen } from "./dafny-commands.js";
 import { leanGen, leanCheck } from "./lean-commands.js";
 import { runInfo, runTypedInfo, type TypedInfoDafny } from "./info-command.js";
-import { RunLog, resolveLogDir, runLogEnabled } from "./run-log.js";
+import { RunLog, resolveLogDir, runLogEnabled, safely } from "./run-log.js";
 import { runRuns } from "./runs-command.js";
 import {
   findUp,
@@ -436,7 +436,7 @@ function runFile(
     // so an aborted run leaves no snapshot; each helper records the stage it detects.
     const logCmd = cmd === "check" || cmd === "regen" ? cmd : null;
     const log = logCmd && runLogOn
-      ? new RunLog({ logDir: resolveLogDir(absPath, configFile), cmd: logCmd, sourcePath: absPath, extraFlags, lscVersion: lscVersion() })
+      ? new RunLog({ logDir: resolveLogDir(absPath, configFile), cmd: logCmd, sourcePath: absPath, extraFlags, lscVersion: safely(lscVersion) })
       : undefined;
 
     if (cmd === "gen") { dafnyGen(genPath, dfyPath, text); return; }
